@@ -1,0 +1,81 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "ws-llm-identity",
+  "main": "./src/index.ts",
+  "compatibility_date": "2026-10-17",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "run_worker_first": true
+  },
+  "vars": {
+    "MACHINE_ISSUER": "http://localhost:8787",
+    "MACHINE_JWT_PUBLIC_JWKS": "{\"keys\":[]}",
+    "PUBLIC_ORIGIN": "http://localhost:8787",
+    "GATEWAY_URL": "ws://localhost:8788/v1/socket"
+  },
+  "triggers": {
+    "crons": [
+      "17 * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0,
+    "redact_query_string": true,
+    "logs": {
+      "enabled": false,
+      "invocation_logs": false
+    },
+    "traces": {
+      "enabled": false
+    }
+  },
+  "secrets": {
+    "required": [
+      "MACHINE_JWT_PRIVATE_JWK",
+      "ENVELOPE_KEYS",
+      "OIDC_PROVIDERS",
+      "BOOTSTRAP_ADMIN_EMAILS"
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ws-llm-proxy-staging",
+      "database_id": "08b3ecc7-22bd-41a0-a5b0-7d9357461a33",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "env": {
+    "staging": {
+      "name": "ws-llm-identity-staging",
+      "secrets": {
+        "required": [
+          "MACHINE_JWT_PRIVATE_JWK",
+          "ENVELOPE_KEYS",
+          "OIDC_PROVIDERS",
+          "BOOTSTRAP_ADMIN_EMAILS"
+        ]
+      },
+      "vars": {
+        "MACHINE_ISSUER": "https://ws-llm-identity-staging.rpa-money.workers.dev",
+        "MACHINE_JWT_PUBLIC_JWKS": "{\"keys\":[{\"kty\":\"EC\",\"x\":\"WX6IKbhoxGQt6paVJP2NgSOplMfZLLWcwh-XPO8o2b4\",\"y\":\"2UDsySDcD8UAMnEVuTd3VRB_ZcdFMz4ujSjvdubfXZM\",\"crv\":\"P-256\",\"kid\":\"staging-bc8f93c38620f52f\",\"alg\":\"ES256\",\"use\":\"sig\"}]}",
+        "PUBLIC_ORIGIN": "https://ws-llm-identity-staging.rpa-money.workers.dev",
+        "GATEWAY_URL": "wss://ws-llm-gateway-staging.rpa-money.workers.dev/v1/socket"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "ws-llm-proxy-staging",
+          "database_id": "08b3ecc7-22bd-41a0-a5b0-7d9357461a33",
+          "migrations_dir": "./migrations"
+        }
+      ]
+    }
+  }
+}

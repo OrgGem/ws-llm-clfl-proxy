@@ -1,0 +1,45 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "ws-llm-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0
+  },
+  "vars": {
+    "GATEWAY_ENVIRONMENT": "local",
+    "MACHINE_ISSUER": "http://localhost:8787"
+  },
+  "secrets": {
+    "required": ["ENVELOPE_KEYS"]
+  },
+  "services": [
+    {
+      "binding": "IDENTITY",
+      "service": "ws-llm-identity",
+      "entrypoint": "IdentityInternal"
+    }
+  ],
+  "env": {
+    "staging": {
+      "name": "ws-llm-gateway-staging",
+      "secrets": {
+        "required": ["ENVELOPE_KEYS"]
+      },
+      "vars": {
+        "GATEWAY_ENVIRONMENT": "staging",
+        "MACHINE_ISSUER": "https://ws-llm-identity-staging.rpa-money.workers.dev"
+      },
+      "services": [
+        {
+          "binding": "IDENTITY",
+          "service": "ws-llm-identity-staging",
+          "entrypoint": "IdentityInternal"
+        }
+      ]
+    }
+  }
+}

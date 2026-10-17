@@ -1,0 +1,33 @@
+{
+  "name": "ws-llm-clfl-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.13.1"
+  },
+  "scripts": {
+    "build:shared": "npm run build --workspace @ws-proxy/shared",
+    "build:ui": "node --check apps/identity/public/app.js && node --check apps/identity/public/api.js && node --check apps/identity/public/bootstrap.js && node --check apps/identity/public/dates.js",
+    "build": "npm run build:shared && npm run build:ui && npm run build --workspaces --if-present",
+    "build:workers": "mkdir -p .wrangler/build/identity .wrangler/build/gateway && wrangler deploy --dry-run --minify --env staging --outdir .wrangler/build/identity --outfile .wrangler/build/identity/bundle.multipart --config apps/identity/wrangler.jsonc && node scripts/extract-worker-bundle.mjs .wrangler/build/identity/bundle.multipart .wrangler/build/identity/worker.js && wrangler deploy --dry-run --minify --env staging --outdir .wrangler/build/gateway --outfile .wrangler/build/gateway/bundle.multipart --config apps/gateway/wrangler.jsonc && node scripts/extract-worker-bundle.mjs .wrangler/build/gateway/bundle.multipart .wrangler/build/gateway/worker.js",
+    "typecheck": "npm run build:shared && npm run typecheck --workspaces --if-present",
+    "test:integration": "npm run build:workers && vitest run --config integration/vitest.gateway.config.ts && vitest run --config integration/vitest.identity.config.ts",
+    "test": "npm run build:shared && vitest run && npm run test --workspace @ws-proxy/identity --if-present && npm run test:integration",
+    "check": "npm run typecheck && npm test && npm run build",
+    "types:workers": "wrangler types --config apps/identity/wrangler.jsonc --include-runtime=false --strict-vars=false apps/identity/worker-configuration.d.ts && wrangler types --config apps/gateway/wrangler.jsonc --include-runtime=false --strict-vars=false apps/gateway/worker-configuration.d.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.4",
+    "@cloudflare/workers-types": "^5.20261016.1",
+    "miniflare": "5.20261012.1-beta",
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.151.1"
+  }
+}

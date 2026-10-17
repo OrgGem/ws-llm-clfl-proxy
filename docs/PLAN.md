@@ -86,9 +86,11 @@ Tạo GitHub template, setup idempotent, hướng dẫn/skill setup và staging 
 - Secrets không xuất hiện trong logs, URLs, UI/config export hoặc Git.
 - Có kết quả benchmark thật trên Workers Free và mô tả giới hạn quan sát.
 
-## Quyết định còn mở
+## Quyết định và gate còn mở
 
-Chưa chọn: framework/ngôn ngữ/package manager, thư viện OAuth/OIDC/JWT, OIDC provider, provider prototype, TTL/numeric limits, protocol schemas, storage format, exact D1 schema, domain/account/bindings, cách revoke nhất quán và cấu hình staging. Đây là đầu việc Phase 1, chưa phải quyết định đã được phê duyệt. Cấu trúc thư mục ứng dụng sẽ được chọn sau contract; chưa scaffold implementation trong bước bootstrap.
+Stack, thư viện, envelope và WebSocket contract đã được chốt tại [ADR 0001](decisions/0001-phase-1-contracts.md); mã nguồn và staging đã có. Đọc [IMPLEMENTATION-STATUS](IMPLEMENTATION-STATUS.md) để phân biệt phần đã kiểm chứng với các gate chưa đạt.
+
+Còn cần cấu hình OIDC application/provider và bootstrap admin thực, API key/model provider thực, xác minh Workers Free, benchmark 1/5/10 trên một socket, kiểm tra ứng dụng OpenCode/browser thật và aggregate usage/error telemetry. OAuth provider vẫn tắt theo điều kiện tích hợp. Production chưa triển khai. Domain/account/bindings staging đã được ghi trong cấu hình và tài liệu vận hành; khi dùng template ở account khác phải tạo resource và thay binding tương ứng.
 
 ## Nguồn cần đối chiếu khi triển khai
 
@@ -99,4 +101,4 @@ Chưa chọn: framework/ngôn ngữ/package manager, thư viện OAuth/OIDC/JWT,
 - OpenAI eligibility: https://developers.openai.com/siwc/token-sharing-open-source
 - Anthropic login: https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account
 
-Các URL được giữ từ yêu cầu ban đầu; chưa xác minh nội dung hiện tại trong bước bootstrap này.
+Đối chiếu nguồn chính thức trước khi thay đổi runtime hoặc auth. Điều kiện tích hợp OAuth provider chưa được xác minh; connector OAuth vẫn tắt và các URL này không phải bằng chứng eligibility.

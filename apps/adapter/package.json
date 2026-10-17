@@ -1,0 +1,31 @@
+{
+  "name": "@ws-proxy/adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "ws-llm-adapter": "./dist/bin.js"
+  },
+  "files": [
+    "dist/bin.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && esbuild src/bin.ts --bundle --platform=node --target=node22 --format=esm --external:ws --external:https-proxy-agent --external:proxy-from-env --external:undici --outfile=dist/bin.js",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^9.1.0",
+    "proxy-from-env": "^2.1.0",
+    "undici": "^7.30.1",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/proxy-from-env": "^1.0.4",
+    "@types/ws": "^8.18.1",
+    "@ws-proxy/shared": "*",
+    "esbuild": "^0.28.2"
+  },
+  "license": "MIT"
+}
