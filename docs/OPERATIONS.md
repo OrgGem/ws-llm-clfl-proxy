@@ -51,7 +51,7 @@ npx wrangler deploy --env staging --config apps/identity/wrangler.jsonc
 npx wrangler deploy --env staging --config apps/gateway/wrangler.jsonc
 ```
 
-Identity exports the private `IdentityInternal` RPC entrypoint. The Gateway staging service binding must target `ws-llm-identity-staging` with that entrypoint. Gateway has no D1 binding. A deployed `/health` response is a code health check, not proof of an end-to-end OIDC/provider flow. Provider OAuth remains disabled.
+Identity exports the private `IdentityInternal` RPC entrypoint. The Gateway staging service binding must target `ws-llm-identity-staging` with that entrypoint. Gateway has no D1 binding. A deployed `/health` response is a code health check, not proof of an end-to-end OIDC/provider flow. ChatGPT local OAuth/discovery and cloud inference have separate states; cloud inference remains disabled by default. Read [the OAuth guide](OAUTH.md).
 
 ## Deployment gates
 
@@ -128,3 +128,10 @@ node scripts/test-live-llm.mjs
 ```
 
 Run only with the owner's authorization: the script can send three real provider requests (JSON, streaming text and streaming tool call), and stops on the first failure. It prints fixed outcomes, status codes and numeric token counters, not prompts, generated content or credentials. Upstream HTTP 402/403 indicates provider rejection; verify account/plan/key permissions instead of retrying or assuming Gateway failure. Custom provider `/models` discovery may be a different URL from its generation Base URL; OpenCode Console publishes the live list at `https://opencode.ai/inference/v1/models`.
+
+
+## Provider OAuth operations
+
+See [OAUTH.md](OAUTH.md) for local adapter login/refresh, safe UI bridge pairing and model discovery. Apply migration 0004 before deploying the new Identity code: existing credentials default to api_key and continue to use their current envelope flow. Never deploy an Identity query that expects credential_kind before that migration has applied.
+
+`CHATGPT_OAUTH_REMOTE_ELIGIBILITY` defaults to `pending`. Only an operator who has verified the actual hosted integration may attest `verified`; it is not a provider approval discovered automatically by the code. This gate is enforced in envelope issuance and every OAuth credential authorization, not just the UI. Keep it pending for this deployment: no hosted eligibility evidence or real ChatGPT OAuth session has been supplied. Claude OAuth remains disabled with an explicit reason while API-key support stays available. Do not populate cloud secrets with provider refresh tokens.

@@ -15,6 +15,11 @@ export interface ModelConfig {
   credentialId: string;
 }
 
+export interface OAuthModelConfig {
+  alias: string;
+  profileId: string;
+}
+
 export interface AdapterConfig {
   version: 1;
   identityUrl: string;
@@ -24,6 +29,8 @@ export interface AdapterConfig {
   port: number;
   models: ModelConfig[];
   envelopes: CredentialEnvelope[];
+  /** Provider OAuth aliases are separate from API-key aliases and contain no credentials. */
+  oauthModels?: OAuthModelConfig[];
 }
 
 export type GatewayProviderPayload = Record<string, unknown>;

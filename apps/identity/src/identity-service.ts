@@ -18,6 +18,7 @@ export interface CredentialMetadata {
   provider: string;
   expiresAt: number;
   keyVersion: string;
+  credentialKind: "api_key" | "oauth_access_token";
 }
 
 export interface AuthorizedProvider {
@@ -99,7 +100,7 @@ async function loadActivePrincipal(
   };
 }
 
-async function validateMachineToken(env: Env, token: string): Promise<{
+export async function validateMachineToken(env: Env, token: string): Promise<{
   claims: GatewayAccessTokenClaims & { iss: string; aud: string | string[]; exp: number };
   principal: AuthorizedPrincipal;
   clientRowId: string;
@@ -150,7 +151,7 @@ export class IdentityInternal extends WorkerEntrypoint<Env> {
 
     const now = Math.floor(Date.now() / 1000);
     const credential = await this.env.DB.prepare(
-      `SELECT id, user_id, project_id, provider, key_version, expires_at, revoked_at
+      `SELECT id, user_id, project_id, provider, key_version, expires_at, revoked_at, credential_kind
        FROM credentials WHERE id = ?`,
     )
       .bind(input.credentialId)
@@ -162,10 +163,21 @@ export class IdentityInternal extends WorkerEntrypoint<Env> {
         key_version: string;
         expires_at: number;
         revoked_at: number | null;
+        credential_kind: "api_key" | "oauth_access_token";
       }>();
     if (!credential) return { allowed: false, reasonCode: "credential_unavailable" };
     if (credential.revoked_at !== null) return { allowed: false, reasonCode: "credential_revoked" };
     if (credential.expires_at <= now) return { allowed: false, reasonCode: "credential_expired" };
+    if (credential.credential_kind !== "api_key" && credential.credential_kind !== "oauth_access_token") {
+      return { allowed: false, reasonCode: "credential_unavailable" };
+    }
+    if (credential.credential_kind === "oauth_access_token" &&
+        (credential.provider !== "openai" || input.provider !== "openai")) {
+      return { allowed: false, reasonCode: "provider_or_model_not_allowed" };
+    }
+    if (credential.credential_kind === "oauth_access_token" && this.env.CHATGPT_OAUTH_REMOTE_ELIGIBILITY !== "verified") {
+      return { allowed: false, reasonCode: "provider_oauth_not_verified" };
+    }
     if (
       credential.user_id !== validated.principal.userId ||
       credential.project_id !== validated.principal.projectId ||
@@ -216,6 +228,7 @@ export class IdentityInternal extends WorkerEntrypoint<Env> {
         provider: credential.provider,
         expiresAt: credential.expires_at,
         keyVersion: credential.key_version,
+        credentialKind: credential.credential_kind,
       },
       authorizedModel: { alias: model.alias, upstreamModel: model.upstream_model },
       authorizedProvider: {

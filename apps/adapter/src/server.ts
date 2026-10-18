@@ -8,6 +8,7 @@ import { CompletionAccumulator, createCompletionId, buildProviderPayload, Provid
 import { SseParser } from "./sse.js";
 import { handleResponses } from "./responses.js";
 import { handleLegacyCompletion } from "./legacy-completions.js";
+import { OAuthBridge, type OAuthBridgeManager } from "./oauth-bridge.js";
 import type { AdapterConfig } from "./types.js";
 import type { ResponseEndMessage, ResponseErrorMessage } from "@ws-proxy/shared";
 
@@ -27,6 +28,9 @@ export interface AdapterServerOptions {
   portOverride?: number;
   gateway?: GatewayExecutor;
   tokenProvider?: TokenProvider;
+  oauthManager?: OAuthBridgeManager;
+  /** Test seam for the local-only one-time pairing code output. */
+  oauthApprovalCodeOutput?: (message: string) => void;
   /** Restrict concurrently active Gateway sockets; set to 1 for one-socket benchmarks. */
   maxGatewaySessions?: number;
 }
@@ -39,13 +43,36 @@ export interface RunningAdapter {
 export async function startAdapter(options: AdapterServerOptions): Promise<RunningAdapter> {
   const config = await options.configStore.load();
   const tokenProvider = options.tokenProvider ?? new TokenProvider(options.configStore);
+  const oauthBridge = new OAuthBridge({
+    identityUrl: config.identityUrl,
+    tokenProvider,
+    ...(options.oauthManager ? { manager: options.oauthManager } : {}),
+    ...(options.oauthApprovalCodeOutput ? { writeApprovalCode: options.oauthApprovalCodeOutput } : {}),
+  });
+  const oauthResolver = oauthBridge.hasEnvelopeResolver()
+    ? async (alias: string) => {
+      if (!(await oauthBridge.hasOAuthModelAlias(alias))) return undefined;
+      return oauthBridge.ensureModelEnvelope(alias, await tokenProvider.getAccessToken());
+    }
+    : undefined;
   const maxGatewaySessions = options.maxGatewaySessions ?? gatewaySessionLimitFromEnvironment();
   if (!Number.isInteger(maxGatewaySessions) || maxGatewaySessions < 1 || maxGatewaySessions > 2) {
     throw new Error("Gateway session limit must be one or two");
   }
   const gateway = options.gateway ?? new GatewayClient(config.gatewayUrl, tokenProvider, maxGatewaySessions);
   const server = createServer((request, response) => {
-    void handleRequest(request, response, config, gateway, maxGatewaySessions).catch(() => {
+    void options.configStore.load().then((latestConfig) => {
+      // OAuth/API-key aliases can be rebound while the adapter is running. Keep
+      // transport and local-auth settings fixed for this process, but resolve
+      // model/envelope bindings from the latest atomic config snapshot.
+      const requestConfig: AdapterConfig = {
+        ...config,
+        models: latestConfig.models,
+        envelopes: latestConfig.envelopes,
+        oauthModels: latestConfig.oauthModels ?? [],
+      };
+      return handleRequest(request, response, requestConfig, gateway, maxGatewaySessions, oauthBridge, oauthResolver);
+    }).catch(() => {
       if (response.destroyed || response.writableEnded) return;
       if (!response.headersSent) {
         sendJson(response, 500, apiError("internal_error", "The adapter could not complete this request"));
@@ -68,9 +95,12 @@ export async function startAdapter(options: AdapterServerOptions): Promise<Runni
     port: address.port,
     close: async () => {
       gateway.close();
+      let oauthCloseError: unknown;
+      try { await options.oauthManager?.close?.(); } catch (error) { oauthCloseError = error; }
       await new Promise<void>((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve());
       });
+      if (oauthCloseError) throw oauthCloseError;
     },
   };
 }
@@ -81,8 +111,18 @@ async function handleRequest(
   config: AdapterConfig,
   gateway: GatewayExecutor,
   maxGatewaySessions: number,
+  oauthBridge: OAuthBridge,
+  oauthResolver?: (alias: string) => Promise<import("@ws-proxy/shared").CredentialEnvelope | undefined>,
 ): Promise<void> {
   const port = request.socket.localPort ?? config.port;
+  let url: URL;
+  try {
+    url = new URL(request.url ?? "/", `http://127.0.0.1:${port}`);
+  } catch {
+    sendJson(response, 400, apiError("invalid_request", "Request target is invalid"));
+    return;
+  }
+  if (await oauthBridge.handle(request, response, port)) return;
   const origin = request.headers.origin;
   if (!isLoopbackRemote(request.socket.remoteAddress) || !isSafeHost(request.headers.host, port) || !isSafeOrigin(origin)) {
     sendJson(response, 403, apiError("forbidden", "Request host or origin is not allowed"));
@@ -104,22 +144,17 @@ async function handleRequest(
     sendJson(response, 401, apiError("unauthorized", "A valid local bearer token is required"));
     return;
   }
-  let url: URL;
-  try {
-    url = new URL(request.url ?? "/", `http://127.0.0.1:${port}`);
-  } catch {
-    sendJson(response, 400, apiError("invalid_request", "Request target is invalid"));
-    return;
-  }
   if (url.search || url.hash) {
     sendJson(response, 400, apiError("invalid_request", "Query strings and fragments are not accepted"));
     return;
   }
   if (request.method === "GET" && url.pathname === "/v1/models") {
+    const oauthAliases = await oauthBridge.listOAuthModelAliases();
+    const modelIds = [...new Set([...config.models.map((model) => model.id), ...oauthAliases])];
     response.setHeader("x-ws-proxy-gateway-session-limit", String(maxGatewaySessions));
     sendJson(response, 200, {
       object: "list",
-      data: config.models.map((model) => ({ id: model.id, object: "model", created: 0, owned_by: "ws-llm-clfl-proxy" })),
+      data: modelIds.map((id) => ({ id, object: "model", created: 0, owned_by: "ws-llm-clfl-proxy" })),
     });
     return;
   }
@@ -128,7 +163,7 @@ async function handleRequest(
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/responses") {
-    await handleResponses(request, response, config, gateway);
+    await handleResponses(request, response, config, gateway, oauthResolver);
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/completions") {
@@ -157,6 +192,10 @@ async function handleCompletion(request: IncomingMessage, response: ServerRespon
   }
   if (rawBody.stream !== undefined && typeof rawBody.stream !== "boolean") {
     sendJson(response, 400, apiError("invalid_request", "stream must be a boolean"));
+    return;
+  }
+  if (config.oauthModels?.some((binding) => binding.alias === rawBody.model)) {
+    sendJson(response, 400, apiError("unsupported_api", "ChatGPT subscription OAuth is supported through the native Responses API only."));
     return;
   }
   const model = config.models.find((candidate) => candidate.id === rawBody.model);

@@ -83,6 +83,10 @@ export async function handleLegacyCompletion(
     return;
   }
 
+  if (config.oauthModels?.some((binding) => binding.alias === input.model)) {
+    sendJson(response, 400, apiError("unsupported_api", "ChatGPT subscription OAuth is supported through the native Responses API only."));
+    return;
+  }
   const model = config.models.find((candidate) => candidate.id === input.model);
   if (!model) {
     sendJson(response, 404, apiError("model_not_found", "Model is not configured for this adapter"));

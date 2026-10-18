@@ -3,7 +3,7 @@ import { chmod, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseCredentialEnvelope } from "@ws-proxy/shared";
-import type { AdapterConfig, CredentialEnvelope, MachineAuth, ModelConfig, ProviderProtocol } from "./types.js";
+import type { AdapterConfig, CredentialEnvelope, MachineAuth, ModelConfig, OAuthModelConfig, ProviderProtocol } from "./types.js";
 
 const DEFAULT_PORT = 43128;
 export class ConfigError extends Error {
@@ -63,7 +63,16 @@ export function validateConfig(value: unknown): AdapterConfig {
     if (!envelope) throw new ConfigError(`Model ${model.id} references an unknown credential ID`);
     if (envelope.provider !== model.provider) throw new ConfigError(`Model ${model.id} provider does not match its envelope`);
   }
-  return { version: 1, identityUrl, gatewayUrl, auth, localBearerToken, port: Number(port), models, envelopes };
+  const rawOAuthModels = value.oauthModels === undefined ? [] : value.oauthModels;
+  if (!Array.isArray(rawOAuthModels) || rawOAuthModels.length > 256) throw new ConfigError("At most 256 OAuth model aliases are supported");
+  const oauthModels = rawOAuthModels.map(validateOAuthModel);
+  const oauthAliases = new Set<string>();
+  for (const model of oauthModels) {
+    if (oauthAliases.has(model.alias)) throw new ConfigError("OAuth model aliases must be unique");
+    if (modelIds.has(model.alias)) throw new ConfigError("An alias cannot be mapped to both an API-key credential and OAuth profile");
+    oauthAliases.add(model.alias);
+  }
+  return { version: 1, identityUrl, gatewayUrl, auth, localBearerToken, port: Number(port), models, envelopes, oauthModels };
 }
 
 function validateAuth(value: unknown): MachineAuth {
@@ -111,6 +120,15 @@ function validateModel(value: unknown): ModelConfig {
     throw new ConfigError("Built-in provider protocol must match its provider ID");
   }
   return { id, provider, protocol: protocol as ProviderProtocol, credentialId: nonEmptyString(value.credentialId, "model.credentialId") };
+}
+
+function validateOAuthModel(value: unknown): OAuthModelConfig {
+  if (!isRecord(value)) throw new ConfigError("OAuth model entries must be objects");
+  const alias = nonEmptyString(value.alias, "oauthModels.alias");
+  if (alias.length > 128 || /[\u0000-\u0020]/.test(alias)) throw new ConfigError("oauthModels.alias must be at most 128 characters without whitespace");
+  const profileId = nonEmptyString(value.profileId, "oauthModels.profileId");
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(profileId)) throw new ConfigError("oauthModels.profileId is invalid");
+  return { alias, profileId };
 }
 
 function validateIdentityUrl(value: unknown): string {

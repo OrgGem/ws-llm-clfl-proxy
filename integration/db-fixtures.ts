@@ -2,6 +2,7 @@ import { applyD1Migrations } from "cloudflare:test";
 import identityMigrationSql from "../apps/identity/migrations/0001_identity.sql?raw";
 import setupMigrationSql from "../apps/identity/migrations/0002_bootstrap_setup.sql?raw";
 import providerRegistryMigrationSql from "../apps/identity/migrations/0003_provider_registry.sql?raw";
+import oauthConnectorsMigrationSql from "../apps/identity/migrations/0004_oauth_connectors.sql?raw";
 
 function migrationQueries(sql: string): string[] {
   return sql
@@ -15,6 +16,7 @@ export async function migrateIdentityDatabase(db: D1Database): Promise<void> {
     { name: "0001_identity.sql", queries: migrationQueries(identityMigrationSql) },
     { name: "0002_bootstrap_setup.sql", queries: migrationQueries(setupMigrationSql) },
     { name: "0003_provider_registry.sql", queries: migrationQueries(providerRegistryMigrationSql) },
+    { name: "0004_oauth_connectors.sql", queries: migrationQueries(oauthConnectorsMigrationSql) },
   ];
   for (const migration of migrations) {
     try {

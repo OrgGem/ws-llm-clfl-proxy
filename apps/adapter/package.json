@@ -1,6 +1,6 @@
 {
   "name": "@ws-proxy/adapter",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -12,11 +12,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && esbuild src/bin.ts --bundle --platform=node --target=node22 --format=esm --external:ws --external:https-proxy-agent --external:proxy-from-env --external:undici --outfile=dist/bin.js",
+    "build": "tsc -p tsconfig.build.json && esbuild src/bin.ts --bundle --platform=node --target=node22 --format=esm --external:ws --external:https-proxy-agent --external:proxy-from-env --external:undici --external:jose --outfile=dist/bin.js",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "https-proxy-agent": "^9.1.0",
+    "jose": "^6.2.12",
     "proxy-from-env": "^2.1.0",
     "undici": "^7.30.1",
     "ws": "^8.18.3"

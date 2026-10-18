@@ -259,6 +259,8 @@ function identityFailure(reasonCode: string | undefined): RequestFailure {
     case "credential_revoked":
     case "credential_expired":
       return new RequestFailure({ code: "credential_invalid", message: "The provider credential is unavailable." });
+    case "provider_oauth_not_verified":
+      return new RequestFailure({ code: "provider_disallowed", message: "Provider OAuth inference is not enabled for this deployment." });
     case "credential_owner_mismatch":
     case "provider_disallowed":
     case "provider_disabled":
@@ -617,6 +619,13 @@ export class GatewaySession {
           api,
         );
         if (metadata.provider !== route.id) throw providerDisallowed();
+        if (metadata.credentialKind !== undefined && metadata.credentialKind !== "api_key" && metadata.credentialKind !== "oauth_access_token") {
+          throw new RequestFailure({ code: "credential_invalid", message: "The provider credential is unavailable." });
+        }
+        if (metadata.credentialKind === "oauth_access_token" &&
+            (api !== "responses" || route.id !== "openai" || route.custom || route.protocol !== "openai" || route.baseUrl !== "https://api.openai.com/v1/")) {
+          throw providerDisallowed();
+        }
         return { metadata, authorizedModel, requestLimits, route };
       };
 

@@ -20,9 +20,10 @@ export function json(data: unknown, status = 200, headers: HeadersInit = {}): Re
   return new Response(JSON.stringify(data), { status, headers: responseHeaders });
 }
 
-export function secureHeaders(response: Response): Response {
+export function secureHeaders(response: Response, options: { allowLoopbackConnect?: boolean } = {}): Response {
   const headers = new Headers(response.headers);
-  headers.set("content-security-policy", "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'");
+  const connectSrc = options.allowLoopbackConnect ? "'self' http://127.0.0.1:*" : "'self'";
+  headers.set("content-security-policy", `default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ${connectSrc}`);
   headers.set("x-content-type-options", "nosniff");
   headers.set("x-frame-options", "DENY");
   headers.set("referrer-policy", "strict-origin-when-cross-origin");

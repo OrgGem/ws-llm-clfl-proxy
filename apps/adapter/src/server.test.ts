@@ -2,9 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConfigStore, createInitialConfig, validateConfig } from "./config.js";
 import { startAdapter, type GatewayExecutor } from "./server.js";
+import type { OAuthBridgeManager } from "./oauth-bridge.js";
+import type { TokenProvider } from "./auth.js";
+import type { CredentialEnvelope } from "@ws-proxy/shared";
 
 const temporaryDirectories: string[] = [];
 const runningServers: Array<{ close(): Promise<void> }> = [];
@@ -33,6 +36,61 @@ describe("loopback OpenAI-compatible HTTP boundary", () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(response.headers.get("x-ws-proxy-gateway-session-limit")).toBe("1");
+  });
+
+  it("keeps OAuth control credentials separate from /v1 and lists mapped OAuth aliases", async () => {
+    const printedCodes: string[] = [];
+    const manager: OAuthBridgeManager = {
+      redeemPairing: async () => ({ projectId: "project_test", expiresAt: Math.floor(Date.now() / 1000) + 120, bindingId: "opaque-binding" }),
+      startLogin: async () => ({ operationId: "operation_test", authorizationUrl: "https://auth.openai.com/api/accounts/authorize?state=test" }),
+      status: async () => ({ status: "pending" }),
+      bindProfile: async () => undefined,
+      discoverModels: async () => [],
+      bindModelProfile: async () => undefined,
+      disconnect: async () => undefined,
+      listOAuthModelAliases: async () => ["chatgpt-plan-model"],
+    };
+    const { server, token } = await createServer(
+      { execute: async () => undefined, close: () => undefined },
+      2,
+      undefined,
+      {
+        oauthManager: manager,
+        tokenProvider: { getAccessToken: async () => "machine-test-token" } as unknown as TokenProvider,
+        oauthApprovalCodeOutput: (message) => printedCodes.push(message),
+      },
+    );
+    const origin = "http://127.0.0.1:3000";
+    const models = await fetch(`http://127.0.0.1:${server.port}/v1/models`, {
+      headers: { origin, authorization: `Bearer ${token}` },
+    });
+    expect((await models.json() as { data: Array<{ id: string }> }).data.map((model) => model.id)).toContain("chatgpt-plan-model");
+
+    const localStatus = await fetch(`http://127.0.0.1:${server.port}/local/oauth/status`, {
+      headers: { origin, authorization: `Bearer ${token}` },
+    });
+    expect(localStatus.status).toBe(401);
+
+    const pairingStart = await fetch(`http://127.0.0.1:${server.port}/local/oauth/pair/start`, {
+      method: "POST",
+      headers: { origin, "content-type": "application/json" },
+      body: JSON.stringify({ pairingToken: `ogt_${"A".repeat(43)}` }),
+    });
+    const pairing = await pairingStart.json() as { pairingId: string };
+    const code = /code: (\d{8})/.exec(printedCodes[0]!)?.[1];
+    expect(code).toMatch(/^\d{8}$/);
+    const approved = await fetch(`http://127.0.0.1:${server.port}/local/oauth/pair/approve`, {
+      method: "POST",
+      headers: { origin, "content-type": "application/json" },
+      body: JSON.stringify({ pairingId: pairing.pairingId, approvalCode: code }),
+    });
+    const localOAuth = await approved.json() as { controlToken: string };
+    expect(approved.status).toBe(200);
+
+    const controlOnV1 = await fetch(`http://127.0.0.1:${server.port}/v1/models`, {
+      headers: { origin, authorization: `Bearer ${localOAuth.controlToken}` },
+    });
+    expect(controlOnV1.status).toBe(401);
   });
 
   it("converts a real API request to Gateway frames and ends SSE only after provider completion", async () => {
@@ -219,6 +277,103 @@ describe("loopback OpenAI-compatible HTTP boundary", () => {
     await cancelled.promise;
     await request;
   });
+
+  it("resolves OAuth Responses aliases to an Identity envelope and never mints for an API-key alias", async () => {
+    const oauthEnvelope: CredentialEnvelope = {
+      v: 1, alg: "A256GCM", kid: "oauth-key", credentialId: "oauth_credential",
+      userId: "user_test", projectId: "project_test", provider: "openai",
+      exp: Math.floor(Date.now() / 1000) + 300, nonce: "AAAAAAAAAAAAAAAA", ciphertext: "AAAAAAAAAAAAAAAAAAAAAA",
+    };
+    const resolve = vi.fn(async (alias: string, bearer: string, api: "responses") => {
+      expect(bearer).toBe("machine-access-token");
+      expect(api).toBe("responses");
+      return alias === "chatgpt-plan-model" || alias === "local-chat" ? oauthEnvelope : undefined;
+    });
+    const gatewayCalls: Array<{ input: Record<string, unknown> }> = [];
+    const gateway: GatewayExecutor = {
+      execute: async (input, callbacks) => {
+        gatewayCalls.push({ input: input as unknown as Record<string, unknown> });
+        const id = `resp_${gatewayCalls.length}`;
+        const events = [
+          { type: "response.created", response: { id, status: "in_progress", model: "provider-model" } },
+          { type: "response.completed", response: { id, object: "response", status: "completed", model: "provider-model", output: [] } },
+        ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+        await callbacks.onChunk(0, events);
+        await callbacks.onEnd({ event: "response.end", requestId: input.requestId, lastSeq: 0 });
+      },
+      close: () => undefined,
+    };
+    const manager: OAuthBridgeManager = {
+      redeemPairing: async () => ({ projectId: "project_test", expiresAt: Math.floor(Date.now() / 1000) + 120, bindingId: "binding_test" }),
+      startLogin: async () => ({ operationId: "operation_test", authorizationUrl: "https://auth.openai.com/api/accounts/authorize?state=x" }),
+      status: async () => ({ status: "pending" }),
+      bindProfile: async () => undefined,
+      discoverModels: async () => [],
+      bindModelProfile: async () => undefined,
+      disconnect: async () => undefined,
+      listOAuthModelAliases: async () => ["chatgpt-plan-model", "local-chat"],
+      ensureModelEnvelope: resolve,
+    };
+    const { server, token, store } = await createServer(gateway, 2, undefined, {
+      oauthManager: manager,
+      tokenProvider: { getAccessToken: async () => "machine-access-token" } as unknown as TokenProvider,
+    });
+    const endpoint = `http://127.0.0.1:${server.port}/v1/responses`;
+    const oauthResponse = await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "chatgpt-plan-model", input: "hello", stream: false }),
+    });
+    expect(oauthResponse.status).toBe(200);
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(gatewayCalls[0]?.input).toMatchObject({
+      api: "responses", provider: "openai", model: "chatgpt-plan-model", envelope: oauthEnvelope,
+    });
+    expect(JSON.stringify(gatewayCalls[0]?.input)).not.toContain("machine-access-token");
+
+    const apiKeyResponse = await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "local-chat", input: "hello", stream: false }),
+    });
+    expect(apiKeyResponse.status).toBe(200);
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(gatewayCalls[1]?.input).toMatchObject({ api: "responses", provider: "openai", model: "local-chat" });
+    expect(gatewayCalls[1]?.input.envelope).not.toEqual(oauthEnvelope);
+
+    await store.update((current) => ({
+      ...current,
+      models: current.models.filter((model) => model.id !== "local-chat"),
+      oauthModels: [{ alias: "local-chat", profileId: "profile_test" }],
+    }));
+    const remappedResponse = await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "local-chat", input: "hello", stream: false }),
+    });
+    expect(remappedResponse.status).toBe(200);
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(gatewayCalls[2]?.input).toMatchObject({ api: "responses", provider: "openai", model: "local-chat", envelope: oauthEnvelope });
+    const modelsResponse = await fetch(`http://127.0.0.1:${server.port}/v1/models`, { headers: { authorization: `Bearer ${token}` } });
+    const ids = (await modelsResponse.json() as { data: Array<{ id: string }> }).data.map((item) => item.id);
+    expect(ids.filter((id) => id === "local-chat")).toHaveLength(1);
+
+    const chatResponse = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "local-chat", messages: [{ role: "user", content: "hello" }] }),
+    });
+    const legacyResponse = await fetch(`http://127.0.0.1:${server.port}/v1/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "local-chat", prompt: "hello" }),
+    });
+    expect(chatResponse.status).toBe(400);
+    expect(await chatResponse.text()).toContain("unsupported_api");
+    expect(legacyResponse.status).toBe(400);
+    expect(await legacyResponse.text()).toContain("unsupported_api");
+    expect(gatewayCalls).toHaveLength(3);
+  });
 });
 
 async function createServer(
@@ -227,9 +382,15 @@ async function createServer(
   model: { id: string; provider: string; protocol?: string; credentialId: string } = {
     id: "local-chat", provider: "openai", credentialId: "credential_test",
   },
+  extra: {
+    oauthManager?: OAuthBridgeManager;
+    tokenProvider?: TokenProvider;
+    oauthApprovalCodeOutput?: (message: string) => void;
+  } = {},
 ): Promise<{
   server: Awaited<ReturnType<typeof startAdapter>>;
   token: string;
+  store: ConfigStore;
 }> {
   const directory = await mkdtemp(path.join(tmpdir(), "adapter-http-"));
   temporaryDirectories.push(directory);
@@ -256,9 +417,14 @@ async function createServer(
     }],
   });
   await store.save(configured);
-  const server = await startAdapter({ configStore: store, portOverride: 0, gateway, maxGatewaySessions });
+  const server = await startAdapter({
+    configStore: store, portOverride: 0, gateway, maxGatewaySessions,
+    ...(extra.oauthManager ? { oauthManager: extra.oauthManager } : {}),
+    ...(extra.tokenProvider ? { tokenProvider: extra.tokenProvider } : {}),
+    ...(extra.oauthApprovalCodeOutput ? { oauthApprovalCodeOutput: extra.oauthApprovalCodeOutput } : {}),
+  });
   runningServers.push(server);
-  return { server, token: configured.localBearerToken };
+  return { server, token: configured.localBearerToken, store };
 }
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {

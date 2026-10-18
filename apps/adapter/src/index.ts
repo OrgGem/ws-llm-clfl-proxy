@@ -1,6 +1,9 @@
 export { configureConfidentialClient, createDeviceLabel, pairPublicClient, parseClientBootstrap, readClientBootstrapFile, TokenProvider } from "./auth.js";
 export type { ClientBootstrap } from "./auth.js";
 export { ConfigError, ConfigStore, createInitialConfig, defaultConfigPath, validateConfig } from "./config.js";
+export { ChatGptOAuthManager, OAuthConnectorError } from "./oauth.js";
+export type { OAuthModelSummary, OAuthOperationStatus, OAuthPairingGrant, OAuthProfileSummary } from "./oauth.js";
+export { OAuthProfileStore, OAuthStoreError } from "./oauth-store.js";
 export { GatewayClient, GatewayOverloadedError, GatewayPayloadTooLargeError, GatewayUnavailableError } from "./gateway.js";
 export { buildProviderPayload, CompletionAccumulator, ProviderStreamConverter } from "./provider.js";
 export { startAdapter } from "./server.js";

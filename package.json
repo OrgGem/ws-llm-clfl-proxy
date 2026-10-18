@@ -21,7 +21,8 @@
     "check": "npm run typecheck && npm test && npm run build",
     "types:workers": "wrangler types --config apps/identity/wrangler.jsonc --include-runtime=false --strict-vars=false apps/identity/worker-configuration.d.ts && wrangler types --config apps/gateway/wrangler.jsonc --include-runtime=false --strict-vars=false apps/gateway/worker-configuration.d.ts",
     "test:ui:browser": "node scripts/test-setup-ui.mjs",
-    "test:ui:providers": "node scripts/test-custom-provider-ui.mjs"
+    "test:ui:providers": "node scripts/test-custom-provider-ui.mjs",
+    "test:ui:oauth": "node scripts/test-oauth-bridge-ui.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.4",

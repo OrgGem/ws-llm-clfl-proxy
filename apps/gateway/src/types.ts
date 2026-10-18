@@ -32,6 +32,7 @@ export interface AuthorizedPrincipal {
 }
 
 export interface AuthorizedCredentialMetadata {
+  credentialKind?: "api_key" | "oauth_access_token";
   credentialId: string;
   userId: string;
   projectId: string;

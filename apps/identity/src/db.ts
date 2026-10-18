@@ -194,6 +194,7 @@ export async function cleanupTransientRows(db: D1Database, now: number): Promise
   await db.batch([
     db.prepare("DELETE FROM oidc_transactions WHERE expires_at <= ?").bind(now),
     db.prepare("DELETE FROM pairing_requests WHERE expires_at <= ?").bind(now - 86_400),
+    db.prepare("DELETE FROM oauth_bridge_grants WHERE expires_at <= ?").bind(now - 86_400),
     db.prepare("DELETE FROM rate_limits WHERE window_start < ?").bind(now - 3_600),
     db.prepare("DELETE FROM sessions WHERE expires_at <= ? OR revoked_at <= ?").bind(now - 2_592_000, now - 2_592_000),
   ]);

@@ -5,6 +5,7 @@ import { assertBrowserWrite, clearAuthCookies, csrfCookie, getWebActor, json, pu
 import { createOidcAuthorizationRequest, OidcCallbackFailure, parseOidcProviders, processOidcCallback, safeReturnTo, type OidcTransaction } from "./oidc.js";
 import { constantTimeEqual, newId, randomToken, sha256Base64Url } from "./security.js";
 import { bootstrapClosureStatements, bootstrapEmailsForAllowlist, handleSetupApi, loadEffectiveOidcConfig, type SetupEnv } from "./bootstrap.js";
+import { handleOAuthApi } from "./oauth-api.js";
 
 export { IdentityInternal };
 
@@ -197,6 +198,10 @@ async function fetchIdentity(request: Request, env: Env): Promise<Response> {
   if (path === "/oauth/token") return handleTokenRequest(request, env);
   if (path === "/pairing/start" || path === "/pairing/token") return handlePublicPairing(request, env);
   if (path === "/api/session" && request.method === "GET") return sessionResponse(request, env);
+  if (path.startsWith("/api/oauth/")) {
+    const oauthResponse = await handleOAuthApi(request, env);
+    if (oauthResponse) return oauthResponse;
+  }
   if (path === "/api/logout") {
     const actor = await getWebActor(request, env);
     return handleLogout(request, env, actor);
@@ -206,10 +211,17 @@ async function fetchIdentity(request: Request, env: Env): Promise<Response> {
   return json({ error: "not_found" }, 404);
 }
 
+function isUiHtmlDocument(request: Request, response: Response): boolean {
+  const path = new URL(request.url).pathname;
+  const isUiPath = path === "/pair" || path === "/ui" || path === "/ui/" || path.startsWith("/ui/");
+  return isUiPath && (response.headers.get("content-type") ?? "").toLowerCase().startsWith("text/html");
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
-      return secureHeaders(await fetchIdentity(request, env));
+      const response = await fetchIdentity(request, env);
+      return secureHeaders(response, { allowLoopbackConnect: isUiHtmlDocument(request, response) });
     } catch (error) {
       const bodyFailure = handleBodyError(error);
       if (bodyFailure) return secureHeaders(bodyFailure);

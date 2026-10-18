@@ -128,6 +128,7 @@ function createSession(options: {
   envelopeKeys?: string;
   providerRegistry?: AuthorizedProvider | null;
   credentialProvider?: string;
+  credentialKind?: "api_key" | "oauth_access_token";
   endpointDnsFetcher?: typeof fetch;
   gatewayOrigin?: string;
 } = {}): TestSession {
@@ -154,6 +155,7 @@ function createSession(options: {
       },
       credentialMetadata: {
         credentialId: "credential-a",
+        credentialKind: options.credentialKind,
         userId: claims.sub,
         projectId: claims.project_id,
         provider: providerRegistry?.id ?? options.credentialProvider ?? "openai",
@@ -1049,6 +1051,46 @@ describe("GatewaySession", () => {
     expect(terminal).toMatchObject({ code: "upstream_error", upstreamStarted: true });
     expect(fetcher).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/chat/completions");
+    test.socket.peerClose();
+  });
+});
+
+describe("Gateway OAuth credential operation boundary", () => {
+  it("reports the server-side OAuth eligibility gate without retry or upstream work", async () => {
+    const test = createSession({ authorize: () => ({ allowed: false, reasonCode: "provider_oauth_not_verified" }) });
+    test.socket.emitMessage(JSON.stringify({ ...startFrame(94, await makeEnvelope()), api: "responses", payload: { input: "test" } }));
+    const terminal = await waitForFrame(test.socket, (value) => value.event === "response.error" && value.requestId === requestId(94));
+    expect(terminal).toMatchObject({ code: "provider_disallowed", retryable: false, upstreamStarted: false });
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it.each([undefined, "chat.completions", "completions"] as const)("rejects OAuth credential for %s before decrypting", async (api) => {
+    const test = createSession({ credentialKind: "oauth_access_token" });
+    const frame = { ...startFrame(91, await makeEnvelope()), ...(api ? { api } : {}) };
+    test.socket.emitMessage(JSON.stringify(frame));
+    const terminal = await waitForFrame(test.socket, (value) => value.event === "response.error" && value.requestId === requestId(91));
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false });
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects an OAuth credential bound to a custom route before dispatch", async () => {
+    const registry: AuthorizedProvider = { id: "custom-oauth", displayName: "Custom", protocol: "openai", baseUrl: "https://api.openai.com/v1/", custom: true };
+    const test = createSession({ credentialKind: "oauth_access_token", providerRegistry: registry });
+    test.socket.emitMessage(JSON.stringify({ ...startFrame(93, await makeEnvelope("user-a", "project-a", registry.id), registry.id), api: "responses", payload: { input: "test" } }));
+    const terminal = await waitForFrame(test.socket, (value) => value.event === "response.error" && value.requestId === requestId(93));
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false });
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("allows authorized OAuth only through native canonical Responses", async () => {
+    const test = createSession({ credentialKind: "oauth_access_token" });
+    test.socket.emitMessage(JSON.stringify({ ...startFrame(92, await makeEnvelope()), api: "responses", payload: { input: "test", store: false } }));
+    await waitForFrame(test.socket, (value) => value.event === "response.end" && value.requestId === requestId(92));
+    expect(test.fetcher.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/responses");
+    expect(JSON.parse(String(test.fetcher.mock.calls[0]?.[1]?.body))).toMatchObject({ store: false, stream: true });
     test.socket.peerClose();
   });
 });

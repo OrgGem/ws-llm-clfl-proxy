@@ -29,3 +29,12 @@ Use this project's own agent identity, persist host/client IDs across restarts, 
 The official overview explicitly covers open-source and locally hosted apps, including self-hosted VM hosts, and directs paid or remotely hosted apps to an interest form. Therefore the existence of OpenCode's local integration establishes the OAuth mechanism and available Responses path, but does not independently establish the documented status of a shared Cloudflare-hosted token-decrypting inference proxy. Client-side login alone does not eliminate that distinction. This is a targeted integration question about the remote inference hop, not a claim that third-party ChatGPT OAuth is unavailable.
 
 No login was attempted, no user OAuth tokens were collected, and no deployment or live provider configuration was changed during this research.
+
+## Claude subscription connector check
+
+Checked 2026-10-18 against Anthropic's official Help Center. Anthropic describes Claude paid plans and the Claude Console as separate products: paid subscriptions provide Claude on web/desktop/mobile, while the Console provides API keys and API access; API usage is billed separately. The article notes that Max and Team plans may include monthly API credits, which does not itself define an OAuth token-sharing flow or authorize a third-party subscription connector.
+
+- [Why Claude API usage is billed separately from paid Claude plans](https://support.claude.com/en/articles/9876003-i-have-a-paid-claude-subscription-pro-max-team-or-enterprise-plans-why-is-claude-api-usage-billed-separately-from-my-paid-claude-plan)
+- [How to access the Claude API](https://support.claude.com/en/articles/8114521-how-can-i-access-the-claude-api)
+
+The checked official material explains Console API access and billing; it does not establish a public third-party OAuth flow for using a consumer Claude subscription through this proxy. This is a limit on what was verified, not a claim that every form of Claude Code subscription sign-in is unavailable. Per ADR 0005, keep the Claude subscription OAuth connector disabled with `subscription_oauth_unavailable` until an authorized third-party integration is verified. Continue to support separately configured Console/API credentials.

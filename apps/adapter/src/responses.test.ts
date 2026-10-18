@@ -69,6 +69,42 @@ describe("native OpenAI Responses HTTP handler", () => {
     expect(payload).not.toHaveProperty("conversation");
   });
 
+  it("blocks OAuth inference while deployment eligibility is pending with a fixed safe error", async () => {
+    const gateway = fakeGateway(async () => { throw new Error("Gateway must not be called"); });
+    const resolver = async () => { throw Object.assign(new Error("private provider detail"), { code: "eligibility_pending" }); };
+    const { url } = await listen(gateway, makeConfig(), resolver);
+    const response = await post(url, { model: "chatgpt-plan-model", input: "hello" });
+    const body = await response.text();
+    expect(response.status).toBe(403);
+    expect(body).toContain("remote_inference_not_verified");
+    expect(body).toContain("Hosted ChatGPT OAuth inference is not enabled for this deployment.");
+    expect(body).not.toContain("private provider detail");
+  });
+
+  it("does not dispatch OAuth inference when the local caller disconnects during envelope minting", async () => {
+    const resolverStarted = deferred<void>();
+    const finishResolver = deferred<import("@ws-proxy/shared").CredentialEnvelope | undefined>();
+    const gateway = fakeGateway(async () => { throw new Error("abandoned request must not reach Gateway"); });
+    const resolver = async () => {
+      resolverStarted.resolve();
+      return finishResolver.promise;
+    };
+    const { url } = await listen(gateway, makeConfig(), resolver);
+    const controller = new AbortController();
+    const request = post(url, { model: "chatgpt-plan-model", input: "hello" }, controller.signal).catch(() => undefined);
+    await resolverStarted.promise;
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    finishResolver.resolve({
+      v: 1, alg: "A256GCM", kid: "oauth-key", credentialId: "oauth_credential",
+      userId: "user_test", projectId: "project_test", provider: "openai",
+      exp: Math.floor(Date.now() / 1000) + 300, nonce: "AAAAAAAAAAAAAAAA", ciphertext: "AAAAAAAAAAAAAAAAAAAAAA",
+    });
+    await request;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(gateway.execute).not.toHaveBeenCalled();
+  });
+
   it("forwards typed SSE events through arbitrary chunk boundaries and holds the terminal until Gateway end", async () => {
     const terminal = JSON.stringify({ type: "response.completed", response: { id: "resp_stream", object: "response", status: "completed", model: "provider-model", output: [] } });
     const initialEvents = [
@@ -327,12 +363,16 @@ describe("native OpenAI Responses HTTP handler", () => {
 });
 
 function fakeGateway(run: GatewayExecutor["execute"]): GatewayExecutor {
-  return { execute: run, close: () => undefined };
+  return { execute: vi.fn(run), close: () => undefined };
 }
 
-async function listen(gateway: GatewayExecutor, config = makeConfig()): Promise<{ url: string }> {
+async function listen(
+  gateway: GatewayExecutor,
+  config = makeConfig(),
+  resolveOAuthEnvelope?: (alias: string) => Promise<import("@ws-proxy/shared").CredentialEnvelope | undefined>,
+): Promise<{ url: string }> {
   const server = createHttpServer((request, response) => {
-    void handleResponses(request, response, config, gateway).catch(() => {
+    void handleResponses(request, response, config, gateway, resolveOAuthEnvelope).catch(() => {
       if (!response.headersSent) {
         response.statusCode = 500;
         response.end(JSON.stringify({ error: "unexpected test handler failure" }));

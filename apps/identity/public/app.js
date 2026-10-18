@@ -13,6 +13,19 @@ const state = {
   setupSaved: false,
   setupAdminMode: false,
   projectId: undefined,
+  oauthPort: "43128",
+  oauthPairingPort: undefined,
+  oauthControlPort: undefined,
+  oauthPairingId: undefined,
+  oauthPairingExpiresAt: undefined,
+  oauthControlToken: undefined,
+  oauthControlExpiresAt: undefined,
+  oauthLoginStatus: undefined,
+  oauthModels: [],
+  oauthAlias: "",
+  oauthBoundAliases: [],
+  oauthError: undefined,
+  oauthNotice: undefined,
   view: "overview",
   main: undefined,
   navButtons: new Map(),
@@ -39,6 +52,12 @@ const VIEWS = {
     icon: "↗",
     title: "Provider connections",
     description: "Add encrypted API credentials and control which models this project can use.",
+  },
+  connections: {
+    label: "Connections",
+    icon: "⤴",
+    title: "Provider sign-in connections",
+    description: "Connect an eligible provider account through your local adapter. Provider tokens stay on the adapter.",
   },
   sessions: {
     label: "Sessions",
@@ -650,6 +669,7 @@ function renderShell() {
     "aria-label": "Current project",
     disabled: projects.length === 0,
     onChange: (event) => {
+      if (state.projectId !== event.target.value) clearOAuthConnectionState();
       state.projectId = event.target.value;
       navigate(state.view);
     },
@@ -750,6 +770,7 @@ async function signOut() {
     state.session = undefined;
     state.csrfToken = undefined;
     state.setupCsrfToken = undefined;
+    clearOAuthConnectionState();
     await initialize();
   } catch (error) {
     showPageError(error);
@@ -763,6 +784,7 @@ async function initialize() {
   try {
     const session = await api.get("/api/session");
     if (!isRecord(session) || session.authenticated !== true) {
+      clearOAuthConnectionState();
       state.setupStatus = undefined;
       state.setupCsrfToken = undefined;
       state.setupConfig = undefined;
@@ -853,6 +875,7 @@ async function renderView(view) {
   if (view === "overview") return renderOverview();
   if (view === "clients") return renderClients();
   if (view === "providers") return renderProviders();
+  if (view === "connections") return renderConnections();
   if (view === "sessions") return renderSessions();
   if (view === "security") return renderSecurity();
   return [emptyState("This view is unavailable", "Choose another section from the navigation.")];
@@ -1260,6 +1283,368 @@ function parsePublicProviderBaseUrl(value) {
   } catch {
     return undefined;
   }
+}
+
+function clearOAuthConnectionState() {
+  state.oauthPairingId = undefined;
+  state.oauthPairingExpiresAt = undefined;
+  state.oauthPairingPort = undefined;
+  state.oauthControlToken = undefined;
+  state.oauthControlExpiresAt = undefined;
+  state.oauthControlPort = undefined;
+  state.oauthLoginStatus = undefined;
+  state.oauthModels = [];
+  state.oauthAlias = "";
+  state.oauthBoundAliases = [];
+  state.oauthAdapterReachable = undefined;
+  state.oauthAuthorizationUrl = undefined;
+  state.oauthProfileEmail = undefined;
+  state.oauthError = undefined;
+  state.oauthNotice = undefined;
+}
+
+function localOAuthEndpoint(path, portOverride) {
+  const rawPort = portOverride === undefined ? state.oauthPort : String(portOverride);
+  const port = Number(rawPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !/^\d{1,5}$/.test(String(rawPort).trim())) {
+    throw new Error("Enter the local adapter port shown in its configuration.");
+  }
+  if (!path.startsWith("/local/oauth/") || path.includes("?") || path.includes("#")) {
+    throw new Error("Local OAuth route is invalid.");
+  }
+  return `http://127.0.0.1:${port}${path}`;
+}
+
+async function localOAuthRequest(path, { method = "GET", body, controlToken } = {}) {
+  const headers = new Headers({ Accept: "application/json" });
+  if (body !== undefined) headers.set("Content-Type", "application/json");
+  if (controlToken) headers.set("Authorization", `Bearer ${controlToken}`);
+  const pinnedPort = controlToken
+    ? state.oauthControlPort
+    : path === "/local/oauth/pair/approve" || path === "/local/oauth/pair/start" ? state.oauthPairingPort : undefined;
+  let response;
+  try {
+    response = await fetch(localOAuthEndpoint(path, pinnedPort), {
+      method,
+      mode: "cors",
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: "omit",
+      cache: "no-store",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+    });
+  } catch {
+    state.oauthAdapterReachable = false;
+    throw new Error("Could not reach the local adapter on this browser device. Start it and check the port. Hosted ChatGPT sessions may not be able to reach your computer; no port scan or remote fallback is used.");
+  }
+  let payload;
+  try { payload = await response.json(); } catch { payload = undefined; }
+  if (!response.ok) {
+    const code = payload?.error?.code;
+    const messages = {
+      approval_rejected: "The local approval code did not match. Check the code printed by your adapter.",
+      pairing_expired: "The local approval code expired. Start a new pairing request.",
+      grant_unavailable: "The Identity pairing grant expired or was already used. Start a new pairing request.",
+      login_pending: "Finish ChatGPT sign-in in the authorization tab before discovering models.",
+      unauthorized: "The local OAuth control session expired. Start a new connection.",
+      oauth_unavailable: "The local OAuth operation could not be completed. Try again from the local adapter.",
+      rate_limited: "Too many pairing attempts. Wait briefly and try again.",
+    };
+    throw new Error(messages[code] ?? `The local adapter rejected the request (${response.status}).`);
+  }
+  return payload;
+}
+
+async function checkLocalOAuthAdapter() {
+  state.oauthError = undefined;
+  state.oauthNotice = undefined;
+  try {
+    const health = await localOAuthRequest("/local/oauth/health");
+    if (health?.reachable !== true) throw new Error("The local adapter did not confirm its bridge is reachable.");
+    state.oauthAdapterReachable = true;
+    state.oauthNotice = health.oauthAvailable === true
+      ? "The local adapter is reachable and has the OAuth bridge enabled."
+      : "The adapter is reachable, but this adapter build has no ChatGPT OAuth connector enabled.";
+  } catch (error) {
+    state.oauthAdapterReachable = false;
+    state.oauthError = error instanceof Error ? error.message : "The local adapter could not be reached.";
+  }
+  await loadCurrentView();
+}
+
+async function beginChatGptPairing() {
+  if (state.busy || !state.projectId) return;
+  state.oauthError = undefined;
+  state.oauthNotice = undefined;
+  setBusy(true);
+  let pairingToken = "";
+  try {
+    const selectedPort = Number(state.oauthPort);
+    localOAuthEndpoint("/local/oauth/health");
+    state.oauthPairingPort = selectedPort;
+    const health = await localOAuthRequest("/local/oauth/health");
+    state.oauthAdapterReachable = health?.reachable === true;
+    if (health?.oauthAvailable !== true) throw new Error("The local adapter is reachable but does not have ChatGPT OAuth enabled.");
+    const grant = await api.post("/api/oauth/pairing", { projectId: state.projectId, connectorId: "chatgpt" });
+    pairingToken = typeof grant?.pairingToken === "string" ? grant.pairingToken : "";
+    if (!/^ogt_[A-Za-z0-9_-]{43}$/.test(pairingToken)) throw new Error("Identity returned an invalid one-time pairing grant.");
+    const local = await localOAuthRequest("/local/oauth/pair/start", { method: "POST", body: { pairingToken } });
+    pairingToken = "";
+    if (typeof local?.pairingId !== "string" || !Number.isSafeInteger(local.expiresAt)) throw new Error("The local adapter returned an invalid pairing response.");
+    state.oauthPairingId = local.pairingId;
+    state.oauthPairingExpiresAt = local.expiresAt;
+    state.oauthControlToken = undefined;
+    state.oauthControlPort = undefined;
+    state.oauthLoginStatus = undefined;
+    state.oauthModels = [];
+    state.oauthNotice = "A one-time code was printed in the local adapter terminal. Enter it here within two minutes to approve ChatGPT sign-in.";
+  } catch (error) {
+    pairingToken = "";
+    state.oauthError = error instanceof Error ? error.message : "ChatGPT pairing could not be started.";
+  } finally {
+    setBusy(false);
+    await loadCurrentView();
+  }
+}
+
+async function approveLocalChatGptPairing(code) {
+  if (state.busy || !state.oauthPairingId) return;
+  state.oauthError = undefined;
+  state.oauthNotice = undefined;
+  setBusy(true);
+  try {
+    const result = await localOAuthRequest("/local/oauth/pair/approve", {
+      method: "POST",
+      body: { pairingId: state.oauthPairingId, approvalCode: code },
+    });
+    if (typeof result?.controlToken !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(result.controlToken)) {
+      throw new Error("The local adapter returned an invalid control session.");
+    }
+    let authorizationUrl;
+    try { authorizationUrl = new URL(result.authorizationUrl); } catch { throw new Error("The local adapter returned an invalid sign-in link."); }
+    if (authorizationUrl.origin !== "https://auth.openai.com" || authorizationUrl.pathname !== "/api/accounts/authorize") {
+      throw new Error("The local adapter returned an untrusted sign-in link.");
+    }
+    state.oauthControlToken = result.controlToken;
+    state.oauthControlExpiresAt = result.expiresAt;
+    state.oauthPairingId = undefined;
+    state.oauthPairingExpiresAt = undefined;
+    state.oauthControlPort = state.oauthPairingPort;
+    state.oauthPairingPort = undefined;
+    state.oauthAuthorizationUrl = authorizationUrl.toString();
+    state.oauthLoginStatus = { status: "pending" };
+    state.oauthModels = [];
+    state.oauthNotice = "Local approval succeeded. Open the ChatGPT sign-in page, complete authorization, then check status here.";
+  } catch (error) {
+    state.oauthError = error instanceof Error ? error.message : "Local approval could not be completed.";
+  } finally {
+    setBusy(false);
+    await loadCurrentView();
+  }
+}
+
+async function checkChatGptOAuthStatus() {
+  if (state.busy || !state.oauthControlToken) return;
+  state.oauthError = undefined;
+  state.oauthNotice = undefined;
+  setBusy(true);
+  try {
+    const status = await localOAuthRequest("/local/oauth/status", { controlToken: state.oauthControlToken });
+    if (status?.status === "connected") {
+      state.oauthLoginStatus = { status: "connected", modelsAvailable: status.modelsAvailable };
+      state.oauthProfileEmail = typeof status.email === "string" ? status.email : undefined;
+      const discovery = await localOAuthRequest("/local/oauth/models", { controlToken: state.oauthControlToken });
+      state.oauthModels = Array.isArray(discovery?.models) ? discovery.models.filter(isRecord).slice(0, 500) : [];
+      state.oauthBoundAliases = Array.isArray(discovery?.boundAliases)
+        ? [...new Set(discovery.boundAliases.filter((alias) => typeof alias === "string" && /^[^\u0000-\u0020]{1,128}$/.test(alias)))].slice(0, 256)
+        : [];
+      state.oauthNotice = "ChatGPT is connected on the local adapter. Discovered models are catalog metadata only; project and client model grants still apply.";
+    } else if (status?.status === "pending") {
+      state.oauthLoginStatus = { status: "pending" };
+      state.oauthNotice = "ChatGPT sign-in is still waiting for approval in the browser tab opened from the local adapter.";
+    } else if (status?.status === "failed") {
+      state.oauthLoginStatus = { status: "failed", code: status.code };
+      state.oauthNotice = "ChatGPT sign-in did not complete. Start a new local pairing request to try again.";
+    } else {
+      throw new Error("The local adapter returned an invalid OAuth status.");
+    }
+  } catch (error) {
+    state.oauthError = error instanceof Error ? error.message : "ChatGPT status could not be checked.";
+  } finally {
+    setBusy(false);
+    await loadCurrentView();
+  }
+}
+
+async function bindLocalChatGptModelAlias(aliasValue) {
+  const alias = aliasValue.trim();
+  if (state.busy || !state.oauthControlToken) return;
+  if (!/^[^\u0000-\u0020]{1,128}$/.test(alias)) {
+    state.oauthError = "Enter an existing OpenAI model alias from this project.";
+    await loadCurrentView();
+    return;
+  }
+  if (!confirmAction(`Bind the local ChatGPT profile to project model alias “${alias}”? This replaces any local API-key or OAuth mapping for that alias. It does not grant project or client access.`)) return;
+  state.oauthError = undefined;
+  state.oauthNotice = undefined;
+  setBusy(true);
+  try {
+    const result = await localOAuthRequest("/local/oauth/model", {
+      method: "POST", body: { alias }, controlToken: state.oauthControlToken,
+    });
+    if (result?.bound !== true || result.alias !== alias) throw new Error("The local adapter returned an invalid model binding response.");
+    state.oauthAlias = alias;
+    state.oauthBoundAliases = [...new Set([...state.oauthBoundAliases, alias])].slice(0, 256);
+    state.oauthNotice = `Local ChatGPT profile mapped to ${alias}. Identity still checks this user's active project and client model grants for each Responses request.`;
+  } catch (error) {
+    state.oauthError = error instanceof Error ? error.message : "The local model alias could not be mapped.";
+  } finally {
+    setBusy(false);
+    await loadCurrentView();
+  }
+}
+
+async function disconnectLocalChatGpt() {
+  if (state.busy || !state.oauthControlToken) return;
+  state.oauthError = undefined;
+  setBusy(true);
+  try {
+    await localOAuthRequest("/local/oauth/disconnect", { method: "POST", body: {}, controlToken: state.oauthControlToken });
+    clearOAuthConnectionState();
+    state.oauthNotice = "ChatGPT was disconnected from the local adapter. This does not revoke any Identity credential already issued.";
+  } catch (error) {
+    state.oauthError = error instanceof Error ? error.message : "ChatGPT could not be disconnected.";
+  } finally {
+    setBusy(false);
+    await loadCurrentView();
+  }
+}
+
+async function renderConnections() {
+  const data = await api.get("/api/oauth/connectors");
+  const connectors = list(data?.connectors);
+  const chatgpt = connectors.find((connector) => connector.id === "chatgpt");
+  const claude = connectors.find((connector) => connector.id === "claude");
+  const portInput = h("input", {
+    className: "input monospace",
+    type: "text",
+    inputmode: "numeric",
+    pattern: "[0-9]{1,5}",
+    maxlength: "5",
+    autocomplete: "off",
+    value: state.oauthPort,
+    "aria-label": "Local adapter port",
+    onInput: (event) => { state.oauthPort = event.target.value; },
+  });
+  const portForm = h("form", { className: "inline-form", onSubmit: (event) => { event.preventDefault(); void checkLocalOAuthAdapter(); } },
+    field("Local adapter port", portInput, "Enter the port shown by the adapter; the browser contacts only 127.0.0.1 and does not scan ports."),
+    h("button", { type: "submit", className: "button secondary", disabled: state.busy, "data-busy-disabled": "true" }, "Check local adapter"),
+  );
+  const pairingForm = h("div", { className: "form-actions" },
+    button("Connect ChatGPT", beginChatGptPairing, "primary", { disabled: state.busy || chatgpt?.localOAuth?.enabled !== true }),
+  );
+  let approvalForm;
+  if (state.oauthPairingId) {
+    const codeInput = h("input", {
+      className: "input monospace",
+      type: "text",
+      inputmode: "numeric",
+      pattern: "[0-9]{8}",
+      minlength: "8",
+      maxlength: "8",
+      autocomplete: "one-time-code",
+      required: "",
+      placeholder: "00000000",
+    });
+    approvalForm = h("form", { className: "inline-form", onSubmit: (event) => {
+      event.preventDefault();
+      if (!approvalForm.reportValidity()) return;
+      const code = codeInput.value;
+      codeInput.value = "";
+      void approveLocalChatGptPairing(code);
+    } },
+      field("Local approval code", codeInput, "Enter the eight-digit code printed by the adapter. It is never sent to Identity."),
+      h("button", { type: "submit", className: "button primary", disabled: state.busy, "data-busy-disabled": "true" }, "Approve locally"),
+    );
+  }
+  const authLink = state.oauthAuthorizationUrl
+    ? h("a", { className: "button secondary", href: state.oauthAuthorizationUrl, target: "_blank", rel: "noopener noreferrer" }, "Open ChatGPT sign-in")
+    : null;
+  const statusActions = state.oauthControlToken ? h("div", { className: "form-actions" },
+    button("Check sign-in status and models", checkChatGptOAuthStatus, "secondary", { disabled: state.busy, title: "Check only this paired local adapter." }),
+    state.oauthLoginStatus?.status === "connected"
+      ? button("Disconnect local profile", disconnectLocalChatGpt, "danger", { disabled: state.busy, small: true })
+      : null,
+  ) : null;
+  const aliasInput = h("input", {
+    className: "input monospace", type: "text", maxlength: "128", autocomplete: "off",
+    value: state.oauthAlias, placeholder: "project-openai-alias", "aria-label": "Existing OpenAI project model alias",
+    onInput: (event) => { state.oauthAlias = event.target.value; },
+  });
+  const aliasForm = state.oauthLoginStatus?.status === "connected"
+    ? h("form", { className: "inline-form", onSubmit: (event) => {
+      event.preventDefault();
+      void bindLocalChatGptModelAlias(aliasInput.value);
+    } },
+      field("Existing OpenAI project model alias", aliasInput, "Use an alias already authorized for your project and client. The adapter will not create or expand grants."),
+      h("button", { type: "submit", className: "button secondary", disabled: state.busy, "data-busy-disabled": "true" }, "Bind local profile"),
+    )
+    : null;
+  const boundAliases = state.oauthBoundAliases.length
+    ? h("div", { className: "list" }, ...state.oauthBoundAliases.map((alias) => h("div", { className: "list-row" },
+      h("div", { className: "row-title monospace" }, alias), badge("Local mapping", "neutral"),
+    )))
+    : null;
+  const modelRows = state.oauthModels.map((model) => h("div", { className: "list-row" },
+    h("div", {},
+      h("div", { className: "row-title" }, display(model.displayName, display(model.id))),
+      h("div", { className: "row-meta monospace" }, model.id),
+      h("div", { className: "row-meta" }, [
+        Number.isSafeInteger(model.contextWindow) ? `${model.contextWindow.toLocaleString()} token context` : null,
+        Array.isArray(model.inputModalities) && model.inputModalities.length ? `Input: ${model.inputModalities.join(", ")}` : null,
+        Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length ? `Reasoning: ${model.reasoningEfforts.join(", ")}` : null,
+      ].filter(Boolean).join(" · ")),
+    ),
+    badge("Catalog only", "neutral"),
+  ));
+  const modelContent = modelRows.length
+    ? h("div", { className: "list" }, ...modelRows)
+    : emptyState("No ChatGPT models discovered", "Connect a ChatGPT profile and check status to load its safe model catalog.", "↗");
+  const remote = isRecord(chatgpt?.remoteInference) ? chatgpt.remoteInference : {};
+  const remoteNotice = remote.enabled === true
+    ? notice("The operator has enabled hosted ChatGPT Responses inference. Use the native /v1/responses API; OAuth credentials are not supported by Chat Completions.", "warning")
+    : notice("Hosted ChatGPT inference is disabled while eligibility is pending. Local sign-in and model discovery do not enable Gateway inference.", "warning");
+  const safeConnector = panel("ChatGPT", "Connect a ChatGPT account to the local adapter. Access and refresh tokens remain on the adapter host.",
+    h("div", { className: "stack" },
+      remoteNotice,
+      notice("This browser bridge reaches only 127.0.0.1 on the port you enter. If you are using a hosted ChatGPT session, the adapter may be unreachable; run the adapter on this same device. A remote CLI or manual callback flow is not available yet.", "info"),
+      portForm,
+      state.oauthAdapterReachable === false ? alertBox("The local adapter is unreachable. Confirm it is running on this computer and the port is correct; no automatic port scanning was attempted.", "info") : null,
+      state.oauthAdapterReachable === true ? notice("The local adapter responded to the exact-origin bridge health check.", "info") : null,
+      state.oauthNotice ? notice(state.oauthNotice, "info") : null,
+      state.oauthError ? alertBox(state.oauthError) : null,
+      pairingForm,
+      approvalForm ?? null,
+      authLink,
+      state.oauthLoginStatus?.status === "pending" ? badge("Sign-in pending", "warning") : null,
+      state.oauthLoginStatus?.status === "connected" ? badge(`Connected${state.oauthProfileEmail ? ` · ${state.oauthProfileEmail}` : ""}`, "success") : null,
+      state.oauthLoginStatus?.status === "failed" ? badge("Sign-in incomplete", "danger") : null,
+      statusActions,
+      aliasForm,
+      boundAliases,
+    ),
+  );
+  const modelPanel = panel("Discovered models", "Catalog IDs are upstream metadata. Bind an existing project alias above; Identity still enforces active project and client model grants. OAuth-mapped aliases use only /v1/responses.", modelContent);
+  const claudePanel = panel("Claude subscription OAuth", "This connector is disabled because an authorized third-party subscription integration is unavailable.",
+    h("div", { className: "stack" },
+      badge("Unavailable", "neutral"),
+      h("p", { className: "panel-description" }, display(claude?.localOAuth?.reasonCode, "subscription_oauth_unavailable") === "subscription_oauth_unavailable"
+        ? "Use an Anthropic Console API credential from the Providers screen. Claude subscription sign-in is not connected to Gateway inference."
+        : "This connector is disabled by Identity policy."),
+    ),
+  );
+  return [safeConnector, modelPanel, claudePanel];
 }
 
 async function renderProviders() {

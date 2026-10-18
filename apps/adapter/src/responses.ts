@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_RESPONSE_BYTES } from "@ws-proxy/shared";
+import type { CredentialEnvelope } from "@ws-proxy/shared";
 import type { ResponseEndMessage, ResponseErrorMessage } from "@ws-proxy/shared";
 import { GatewayOverloadedError, GatewayPayloadTooLargeError, type GatewayRequestInput } from "./gateway.js";
 import { SseParser, type SseEvent } from "./sse.js";
@@ -23,6 +24,7 @@ export async function handleResponses(
   response: ServerResponse,
   config: AdapterConfig,
   gateway: GatewayExecutor,
+  resolveOAuthEnvelope?: (modelAlias: string) => Promise<CredentialEnvelope | undefined>,
 ): Promise<void> {
   if (!request.headers["content-type"]?.toLowerCase().startsWith("application/json")) {
     sendJson(response, 415, apiError("invalid_request", "Content-Type must be application/json"));
@@ -81,7 +83,55 @@ export async function handleResponses(
     return;
   }
 
-  const model = config.models.find((candidate) => candidate.id === rawBody.model);
+  const abortController = new AbortController();
+  const socket = request.socket;
+  const onRequestAborted = () => abortController.abort();
+  const onSocketClose = () => abortController.abort();
+  const onResponseClose = () => {
+    if (!response.writableEnded) abortController.abort();
+    cleanupDisconnectListeners();
+  };
+  const cleanupDisconnectListeners = () => {
+    request.off("aborted", onRequestAborted);
+    socket.off("close", onSocketClose);
+    response.off("close", onResponseClose);
+  };
+  request.once("aborted", onRequestAborted);
+  socket.once("close", onSocketClose);
+  response.once("close", onResponseClose);
+  response.once("finish", cleanupDisconnectListeners);
+
+  let model = config.models.find((candidate) => candidate.id === rawBody.model);
+  let envelope: CredentialEnvelope | undefined;
+  if (model) {
+    // API-key aliases never invoke the OAuth resolver or refresh/mint provider credentials.
+    envelope = config.envelopes.find((candidate) => candidate.credentialId === model!.credentialId);
+  } else if (resolveOAuthEnvelope) {
+    try {
+      envelope = await resolveOAuthEnvelope(rawBody.model);
+    } catch (error) {
+      if (abortController.signal.aborted || response.destroyed || request.socket.destroyed) return;
+      const code = oauthFailureCode(error);
+      if (code === "eligibility_pending") {
+        sendJson(response, 403, apiError("remote_inference_not_verified", "Hosted ChatGPT OAuth inference is not enabled for this deployment."));
+      } else if (code === "pairing_required" || code === "profile_disconnected") {
+        sendJson(response, 403, apiError("oauth_pairing_required", "Connect this ChatGPT profile to the authorized project before using this model."));
+      } else if (code === "responses_required") {
+        sendJson(response, 400, apiError("unsupported_api", "ChatGPT subscription OAuth is supported through the native Responses API only."));
+      } else {
+        sendJson(response, 502, apiError("credential_unavailable", "Identity could not prepare the authorized ChatGPT credential."));
+      }
+      return;
+    }
+    if (abortController.signal.aborted || response.destroyed || request.socket.destroyed) return;
+    if (envelope) {
+      if (envelope.provider !== "openai" || !envelope.credentialId || envelope.exp <= Math.floor(Date.now() / 1000)) {
+        sendJson(response, 401, apiError("credential_invalid", "Identity returned an unavailable ChatGPT credential."));
+        return;
+      }
+      model = { id: rawBody.model, provider: "openai", protocol: "openai", credentialId: envelope.credentialId };
+    }
+  }
   if (!model) {
     sendJson(response, 404, apiError("model_not_found", "Model is not configured for this adapter"));
     return;
@@ -90,7 +140,6 @@ export async function handleResponses(
     sendJson(response, 400, apiError("unsupported_api", "The Responses API requires an OpenAI-protocol provider"));
     return;
   }
-  const envelope = config.envelopes.find((candidate) => candidate.credentialId === model.credentialId);
   if (!envelope) {
     sendJson(response, 400, apiError("credential_invalid", "Model credential envelope is not available"));
     return;
@@ -106,13 +155,7 @@ export async function handleResponses(
   const parser = new SseParser(MAX_SSE_EVENT_CHARS);
   const stream = new ResponsesStream(model);
   const writer = new ResponsesWriter(response, model.id, isStreaming);
-  const abortController = new AbortController();
   let upstreamBytes = 0;
-
-  request.once("aborted", () => abortController.abort());
-  response.once("close", () => {
-    if (!response.writableEnded) abortController.abort();
-  });
 
   const callbacks = {
     onChunk: async (_seq: number, data: string) => {
@@ -156,6 +199,7 @@ export async function handleResponses(
     payload,
   };
   try {
+    if (abortController.signal.aborted || response.destroyed || request.socket.destroyed) return;
     await gateway.execute(input, callbacks, abortController.signal);
   } catch (error) {
     if (!abortController.signal.aborted) {
@@ -169,6 +213,12 @@ export async function handleResponses(
       await writer.fail(code, message, status, stream.nextSequenceNumber());
     }
   }
+}
+
+function oauthFailureCode(error: unknown): string | undefined {
+  if (error === null || typeof error !== "object") return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : undefined;
 }
 
 function responsesPayload(body: JsonRecord): JsonRecord {
