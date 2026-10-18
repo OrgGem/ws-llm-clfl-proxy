@@ -74,7 +74,7 @@ A failed request is:
 
 `lastSeq` has the same meaning as on `response.end`. `upstreamStarted` is true as soon as Gateway starts the provider fetch; the provider may already have processed or billed the attempt even when no response chunk arrived. `retryable` means the condition may be transient, not that replay is safe. Gateway never retries. A client retry is a new attempt with a new `requestId`; it must not append to or merge with the old stream. `message` is short, safe text and never contains the raw provider response, key, envelope, request payload, or internal stack trace.
 
-The v1 `code` values are `invalid_request`, `unauthorized`, `forbidden`, `credential_invalid`, `provider_disallowed`, `model_disallowed`, `overloaded`, `upstream_rate_limited`, `upstream_error`, `upstream_timeout`, `response_too_large`, `slow_client`, `cancelled`, `session_expired`, and `internal_error`. Only the relevant request receives a terminal error. Do not expose provider response bodies or authentication details in error messages.
+The v1 `code` values are `invalid_request`, `unauthorized`, `forbidden`, `credential_invalid`, `provider_disallowed`, `model_disallowed`, `overloaded`, `upstream_rate_limited`, `upstream_error`, `upstream_timeout`, `response_too_large`, `slow_client`, `cancelled`, `session_expired`, and `internal_error`. Only the relevant request receives a terminal error. Do not expose provider response bodies or raw authentication data in error messages. Authenticated clients may receive bounded HTTP status and fixed allowlisted rejection categories, including credential, workspace, budget and model policy, as defined in ADR 0003; arbitrary provider descriptions are excluded.
 
 When a token approaches expiry, the server sends:
 

@@ -27,4 +27,6 @@ Native provider capability is external: a custom OpenAI-compatible endpoint may 
 
 ## Live provider diagnostics
 
-A rejected upstream HTTP response exposes only its bounded numeric HTTP status in a fixed Gateway error message. Response bodies, error descriptions, headers and exception text remain excluded. This distinguishes credential/parameter/provider failures without reading the provider key or relaxing the allowlist; the Gateway still never retries. HTTP 429 retains its existing rate-limit classification.
+A rejected upstream HTTP response exposes its bounded numeric HTTP status and an optional fixed allowlisted rejection category in a safe Gateway error message. Response bodies, error descriptions, headers and exception text remain excluded. This distinguishes credential/parameter/provider failures without reading the provider key or relaxing the allowlist; the Gateway still never retries. HTTP 429 retains its existing rate-limit classification.
+
+Provider rejection diagnostics may additionally classify a bounded JSON error body into a fixed allowlisted reason (workspace, budget, credential, model or subscription policy). Parsing is limited to 16 KiB and a two-second deadline; arbitrary body values, error descriptions and exception text are never returned or logged. Classification is diagnostic evidence, not an automatic decision to change the provider route or authentication. Explicit HTML errors may receive the fixed category `non_json_error` without reading their contents. Unknown error data retains only HTTP status.

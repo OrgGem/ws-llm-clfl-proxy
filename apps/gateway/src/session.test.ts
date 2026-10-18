@@ -1018,6 +1018,16 @@ describe("GatewaySession", () => {
     expect(test.socket.closeCode).toBe(1009);
   });
 
+  it("classifies provider policy errors without exposing provider error text", async () => {
+    const test = createSession({ fetcher: async () => Response.json({ error: { type: "FreeTierError", message: "sk-sensitive-key-private-prompt" } }, { status: 403 }) });
+    test.socket.emitMessage(JSON.stringify(startFrame(29, await makeEnvelope())));
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === requestId(29));
+    expect(terminal).toMatchObject({ code: "upstream_error", message: "The provider returned HTTP 403 (free_model_restricted).", upstreamStarted: true, retryable: false });
+    expect(JSON.stringify(terminal)).not.toContain("sk-sensitive");
+    expect(test.fetcher).toHaveBeenCalledOnce();
+    test.socket.peerClose();
+  });
+
   it.each([400, 401, 403, 500])("reports only safe upstream HTTP status %i", async (status) => {
     const test = createSession({ fetcher: async () => new Response('private-key-and-prompt-must-not-leak', { status }) });
     test.socket.emitMessage(JSON.stringify(startFrame(28, await makeEnvelope())));

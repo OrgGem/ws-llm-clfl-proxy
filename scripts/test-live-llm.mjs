@@ -26,8 +26,10 @@ async function send(body) {
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     const code = /^[a-z_]+$/.test(body.error?.code ?? '') ? body.error.code : 'unknown';
-    const upstream = /^The provider returned HTTP (\d{3})\.$/.exec(body.error?.message ?? '')?.[1];
-    throw new Error(`HTTP ${response.status}; code=${code}${upstream ? '; upstream=' + upstream : ''}`);
+    const diagnostic = /^The provider returned HTTP (\d{3})(?: \(([a-z_]+)\))?\.$/.exec(body.error?.message ?? '');
+    const knownReasons = new Set(['org_required', 'forbidden', 'invalid_api_key', 'billing_rejected', 'budget_exceeded', 'model_not_found', 'model_not_allowed', 'subscription_required', 'free_model_restricted', 'invalid_request', 'non_json_error']);
+    const reason = knownReasons.has(diagnostic?.[2]) ? diagnostic[2] : undefined;
+    throw new Error(`HTTP ${response.status}; code=${code}${diagnostic ? '; upstream=' + diagnostic[1] : ''}${reason ? '; reason=' + reason : ''}`);
   }
   return response;
 }
@@ -85,7 +87,7 @@ try {
   results.push({ test: current, success: true, wallMs: Math.round(performance.now() - started), toolDeltaCount: deltas.length, usage: usageCounters(toolEvents.findLast((event) => event.usage)?.usage) });
   console.log(JSON.stringify({ realProvider: true, results, automaticRetries: 0 }));
 } catch (error) {
-  const message = error instanceof Error && /^(HTTP \d{3}; code=[a-z_]+(?:; upstream=\d{3})?|SSE error; code=[a-z_]+)$/.test(error.message) ? error.message : 'Result did not satisfy the live test assertions';
+  const message = error instanceof Error && /^(HTTP \d{3}; code=[a-z_]+(?:; upstream=\d{3})?(?:; reason=[a-z_]+)?|SSE error; code=[a-z_]+)$/.test(error.message) ? error.message : 'Result did not satisfy the live test assertions';
   console.log(JSON.stringify({ realProvider: true, results, failedTest: current, message, automaticRetries: 0 }));
   process.exitCode = 1;
 } finally {

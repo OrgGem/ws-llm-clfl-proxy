@@ -20,6 +20,7 @@ import {
   type GatewayServerFrame,
 } from "@ws-proxy/shared";
 import { decryptCredentialEnvelope, type CredentialEnvelope } from "@ws-proxy/shared";
+import { classifyProviderError } from "./provider-error.js";
 import {
   buildProviderRequest,
   BUILTIN_PROVIDERS,
@@ -738,11 +739,12 @@ export class GatewaySession {
         });
       }
       if (!response.ok) {
+        const reason = await classifyProviderError(response);
         await this.discardResponse(response);
         throw new RequestFailure({
           code: "upstream_error",
           message: Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
-            ? `The provider returned HTTP ${response.status}.`
+            ? `The provider returned HTTP ${response.status}${reason ? ` (${reason})` : ""}.`
             : "The provider could not complete this request.",
           retryable: response.status >= 500,
         });
