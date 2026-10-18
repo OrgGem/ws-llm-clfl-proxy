@@ -17,6 +17,8 @@ Read [docs/PLAN.md](docs/PLAN.md) for architecture, implementation order, accept
 - Keep provider OAuth disabled until eligibility and hosted-proxy support are verified with current official sources.
 
 ## Delivery
+After each completed implementation, run the relevant checks, commit the changes and push the current branch. Report the commit and any remaining verification gates.
+
 Implement in the plan's phase order. Validate changed behavior with focused tests; security and stream behavior require negative-path coverage. Report actual commands and outcomes, and label unrun checks. Keep benchmark measurements separate from assumptions; ten requests per socket is an experiment, not a capacity promise. Deploy staging and verify before production. Use repeatable setup and migrations; keep secrets and generated local state outside Git.
 
 ## Current state

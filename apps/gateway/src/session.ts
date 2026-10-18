@@ -741,7 +741,9 @@ export class GatewaySession {
         await this.discardResponse(response);
         throw new RequestFailure({
           code: "upstream_error",
-          message: "The provider could not complete this request.",
+          message: Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+            ? `The provider returned HTTP ${response.status}.`
+            : "The provider could not complete this request.",
           retryable: response.status >= 500,
         });
       }

@@ -1018,6 +1018,16 @@ describe("GatewaySession", () => {
     expect(test.socket.closeCode).toBe(1009);
   });
 
+  it.each([400, 401, 403, 500])("reports only safe upstream HTTP status %i", async (status) => {
+    const test = createSession({ fetcher: async () => new Response('private-key-and-prompt-must-not-leak', { status }) });
+    test.socket.emitMessage(JSON.stringify(startFrame(28, await makeEnvelope())));
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === requestId(28));
+    expect(terminal).toMatchObject({ code: "upstream_error", message: `The provider returned HTTP ${status}.`, upstreamStarted: true, retryable: status >= 500 });
+    expect(JSON.stringify(terminal)).not.toContain("private-key-and-prompt");
+    expect(test.fetcher).toHaveBeenCalledOnce();
+    test.socket.peerClose();
+  });
+
   it("does not follow provider redirects or send credentials to their destination", async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       expect(init?.redirect).toBe("manual");

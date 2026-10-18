@@ -24,3 +24,7 @@ Continue testing the established public boundaries: loopback HTTP requests and S
 - https://developers.cloudflare.com/workers/best-practices/workers-best-practices/
 
 Native provider capability is external: a custom OpenAI-compatible endpoint may implement Chat Completions without implementing Responses or legacy Completions. There is no silent fallback or retry to another API.
+
+## Live provider diagnostics
+
+A rejected upstream HTTP response exposes only its bounded numeric HTTP status in a fixed Gateway error message. Response bodies, error descriptions, headers and exception text remain excluded. This distinguishes credential/parameter/provider failures without reading the provider key or relaxing the allowlist; the Gateway still never retries. HTTP 429 retains its existing rate-limit classification.
