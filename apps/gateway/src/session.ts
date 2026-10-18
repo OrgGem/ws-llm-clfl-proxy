@@ -11,6 +11,9 @@ import {
   MAX_REQUEST_IDS_PER_SOCKET,
   MAX_RESPONSE_FRAME_BYTES,
   MAX_RESPONSE_BYTES,
+  assertPublicEndpointResolution,
+  buildProviderEndpoint,
+  normalizeBaseUrl,
   parseGatewayFrame,
   type RequestStartMessage,
   type GatewayServerFrame,
@@ -18,14 +21,18 @@ import {
 import { decryptCredentialEnvelope, type CredentialEnvelope } from "@ws-proxy/shared";
 import {
   buildProviderRequest,
+  BUILTIN_PROVIDERS,
   isProviderId,
+  isProviderProtocol,
   ProviderCallError,
   providerKeyFromBytes,
   validateUpstreamModel,
-  type ProviderId,
+  type ProviderProtocol,
 } from "./providers.js";
 import type {
+  AuthorizedModel,
   AuthorizedCredentialMetadata,
+  AuthorizedPrincipal,
   GatewayDependencies,
   MachineClaims,
   ProjectLimits,
@@ -92,8 +99,78 @@ interface EnvelopeKeySet {
   keys: Record<string, string>;
 }
 
+interface ProviderRoute {
+  readonly id: string;
+  readonly protocol: ProviderProtocol;
+  readonly baseUrl: string;
+  readonly endpoint: string;
+  readonly custom: boolean;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function providerDisallowed(): RequestFailure {
+  return new RequestFailure({
+    code: "provider_disallowed",
+    message: "This provider is not enabled for the project.",
+  });
+}
+
+function resolveProviderRoute(
+  value: unknown,
+  requestedProvider: string,
+  forbiddenOrigins: readonly string[],
+): ProviderRoute {
+  if (value === undefined) {
+    if (!isProviderId(requestedProvider)) throw providerDisallowed();
+    const builtin = BUILTIN_PROVIDERS[requestedProvider];
+    return {
+      id: requestedProvider,
+      protocol: builtin.protocol,
+      baseUrl: builtin.baseUrl,
+      endpoint: builtin.endpoint,
+      custom: false,
+    };
+  }
+
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.displayName !== "string" ||
+      !isProviderProtocol(value.protocol) || typeof value.baseUrl !== "string" || typeof value.custom !== "boolean" ||
+      value.id !== requestedProvider) {
+    throw providerDisallowed();
+  }
+
+  let baseUrl: string;
+  try {
+    baseUrl = normalizeBaseUrl(value.baseUrl, { forbiddenOrigins });
+  } catch {
+    throw providerDisallowed();
+  }
+
+  if (value.custom) {
+    // Custom rows have their own identities; they cannot shadow the built-in
+    // credential namespaces or bypass the official endpoint configuration.
+    if (isProviderId(value.id)) throw providerDisallowed();
+    let endpoint: string;
+    try {
+      endpoint = buildProviderEndpoint(value.protocol, baseUrl);
+    } catch {
+      throw providerDisallowed();
+    }
+    return { id: value.id, protocol: value.protocol, baseUrl, endpoint, custom: true };
+  }
+
+  if (!isProviderId(value.id) || value.protocol !== value.id) throw providerDisallowed();
+  const builtin = BUILTIN_PROVIDERS[value.id];
+  if (baseUrl !== builtin.baseUrl) throw providerDisallowed();
+  return {
+    id: value.id,
+    protocol: builtin.protocol,
+    baseUrl: builtin.baseUrl,
+    endpoint: builtin.endpoint,
+    custom: false,
+  };
 }
 
 export function boundedProjectLimits(value: unknown): ProjectLimits | undefined {
@@ -397,15 +474,6 @@ export class GatewaySession {
       );
       return;
     }
-    if (!isProviderId(message.provider)) {
-      this.sendRequestError(
-        message.requestId,
-        new RequestFailure({ code: "provider_disallowed", message: "This provider is not supported." }),
-        -1,
-        false,
-      );
-      return;
-    }
     if (message.envelope.provider !== message.provider) {
       this.sendRequestError(
         message.requestId,
@@ -468,47 +536,101 @@ export class GatewaySession {
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let reservedReadBytes = 0;
     try {
-      const authorization = await this.awaitTask(task, this.dependencies.identity.authorizeTokenRequest({
+      const forbiddenOrigins = [new URL(this.dependencies.machineIssuer).origin];
+      if (this.dependencies.gatewayOrigin) {
+        forbiddenOrigins.push(new URL(this.dependencies.gatewayOrigin).origin);
+      }
+      const authorize = () => this.dependencies.identity.authorizeTokenRequest({
         accessToken: this.accessToken,
         credentialId: task.message.envelope.credentialId,
         provider: task.message.provider,
         model: task.message.model,
-      }));
+      });
+      const readAuthorization = (authorization: unknown) => {
+        if (!isRecord(authorization) || typeof authorization.allowed !== "boolean") {
+          throw new RequestFailure({ code: "internal_error", message: "Gateway authorization returned an invalid result." });
+        }
+        if (!authorization.allowed) {
+          throw identityFailure(typeof authorization.reasonCode === "string" ? authorization.reasonCode : undefined);
+        }
+        const requestLimits = boundedProjectLimits(authorization.limits);
+        if (!requestLimits) {
+          throw new RequestFailure({ code: "internal_error", message: "Gateway authorization returned invalid project limits." });
+        }
+        if (this.active.size > Math.min(this.limits.maxConcurrency, requestLimits.maxConcurrency)) {
+          throw new RequestFailure({ code: "overloaded", message: "Too many requests are active on this session." });
+        }
+        const metadata = authorization.credentialMetadata as AuthorizedCredentialMetadata | undefined;
+        const principal = authorization.principal as AuthorizedPrincipal | undefined;
+        const authorizedModel = authorization.authorizedModel as AuthorizedModel | undefined;
+        if (!metadata || !principal || !authorizedModel) {
+          throw new RequestFailure({ code: "internal_error", message: "Gateway authorization returned incomplete data." });
+        }
+        if (principal.userId !== this.claims.sub || principal.projectId !== this.claims.project_id ||
+            principal.clientId !== this.claims.client_id || principal.sessionId !== this.claims.sid ||
+            !credentialMetadataMatches(task.message.envelope, metadata, this.claims, task.message)) {
+          throw new RequestFailure({ code: "credential_invalid", message: "The provider credential is unavailable." });
+        }
+        if (authorizedModel.alias !== task.message.model || !validateUpstreamModel(authorizedModel.upstreamModel)) {
+          throw new RequestFailure({ code: "model_disallowed", message: "This model is not enabled for the project." });
+        }
+        const providerPayloadBytes = encoder.encode(JSON.stringify({
+          ...task.message.payload,
+          model: authorizedModel.upstreamModel,
+          stream: true,
+        })).byteLength;
+        if (providerPayloadBytes > requestLimits.maxPayloadBytes) {
+          throw new RequestFailure({ code: "invalid_request", message: "The request payload exceeds the project limit." });
+        }
+        const route = resolveProviderRoute(authorization.authorizedProvider, task.message.provider, forbiddenOrigins);
+        if (metadata.provider !== route.id) throw providerDisallowed();
+        return { metadata, authorizedModel, requestLimits, route };
+      };
+
+      let authorization = await this.awaitTask(task, authorize());
       if (task.terminalSent) return;
-      if (!isRecord(authorization) || typeof authorization.allowed !== "boolean") {
-        throw new RequestFailure({ code: "internal_error", message: "Gateway authorization returned an invalid result." });
+      let validated = readAuthorization(authorization);
+      if (validated.route.custom) {
+        try {
+          const dnsValidation = assertPublicEndpointResolution(
+            validated.route.endpoint,
+            this.dependencies.endpointDnsFetcher ?? this.dependencies.fetcher,
+          );
+          await this.awaitTask(task, dnsValidation);
+        } catch (error) {
+          if (error instanceof RequestFailure) throw error;
+          throw providerDisallowed();
+        }
+        if (task.terminalSent) return;
+        if (this.now() >= this.claims.exp * 1000) {
+          this.tokenExpired = true;
+          this.stopNewStarts = true;
+          throw new RequestFailure({ code: "session_expired", message: "The Gateway session has expired." });
+        }
+
+        // DNS checks can take several seconds; reauthorize custom providers
+        // afterward so a revoked D1 registration or project grant cannot race
+        // the lookup and still launch upstream.
+        authorization = await this.awaitTask(task, authorize());
+        if (task.terminalSent) return;
+        const refreshed = readAuthorization(authorization);
+        if (refreshed.route.custom !== validated.route.custom ||
+            refreshed.route.id !== validated.route.id ||
+            refreshed.route.protocol !== validated.route.protocol ||
+            refreshed.route.baseUrl !== validated.route.baseUrl ||
+            refreshed.route.endpoint !== validated.route.endpoint) {
+          throw providerDisallowed();
+        }
+        validated = refreshed;
       }
-      if (!authorization.allowed) throw identityFailure(authorization.reasonCode);
-      const requestLimits = boundedProjectLimits(authorization.limits);
-      if (!requestLimits) {
-        throw new RequestFailure({ code: "internal_error", message: "Gateway authorization returned invalid project limits." });
+      const { metadata, authorizedModel, route } = validated;
+      const provider = route.protocol;
+      if (task.terminalSent || this.closed || this.socket.readyState !== 1) return;
+      if (this.now() >= this.claims.exp * 1000) {
+        this.tokenExpired = true;
+        this.stopNewStarts = true;
+        throw new RequestFailure({ code: "session_expired", message: "The Gateway session has expired." });
       }
-      if (this.active.size > Math.min(this.limits.maxConcurrency, requestLimits.maxConcurrency)) {
-        throw new RequestFailure({ code: "overloaded", message: "Too many requests are active on this session." });
-      }
-      const metadata = authorization.credentialMetadata;
-      const principal = authorization.principal;
-      const authorizedModel = authorization.authorizedModel;
-      if (!metadata || !principal || !authorizedModel) {
-        throw new RequestFailure({ code: "internal_error", message: "Gateway authorization returned incomplete data." });
-      }
-      if (principal.userId !== this.claims.sub || principal.projectId !== this.claims.project_id ||
-          principal.clientId !== this.claims.client_id || principal.sessionId !== this.claims.sid ||
-          !credentialMetadataMatches(task.message.envelope, metadata, this.claims, task.message)) {
-        throw new RequestFailure({ code: "credential_invalid", message: "The provider credential is unavailable." });
-      }
-      if (authorizedModel.alias !== task.message.model || !validateUpstreamModel(authorizedModel.upstreamModel)) {
-        throw new RequestFailure({ code: "model_disallowed", message: "This model is not enabled for the project." });
-      }
-      const providerPayloadBytes = encoder.encode(JSON.stringify({
-        ...task.message.payload,
-        model: authorizedModel.upstreamModel,
-        stream: true,
-      })).byteLength;
-      if (providerPayloadBytes > requestLimits.maxPayloadBytes) {
-        throw new RequestFailure({ code: "invalid_request", message: "The request payload exceeds the project limit." });
-      }
-      const provider = task.message.provider as ProviderId;
       let key: Uint8Array;
       try {
         const keySet = envelopeKeySet(this.dependencies.envelopeKeys);
@@ -555,6 +677,7 @@ export class GatewaySession {
       }
       const providerRequest = buildProviderRequest(
         provider,
+        route.endpoint,
         apiKey,
         authorizedModel.upstreamModel,
         task.message.payload,
@@ -1093,8 +1216,8 @@ export async function validateHandshakeToken(
   }
 }
 
-export function isSupportedProvider(provider: string): provider is ProviderId {
-  return isProviderId(provider);
+export function isSupportedProvider(provider: string): boolean {
+  return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(provider);
 }
 
 export function isCredentialEnvelope(value: unknown): value is CredentialEnvelope {

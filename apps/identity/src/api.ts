@@ -1,8 +1,10 @@
+import { ProviderEndpointSecurityError } from "@ws-proxy/shared";
 import { createCredentialEnvelope, newId, randomToken, readJson, readTextBody, RequestBodyError, sha256Base64Url, constantTimeEqual, envelopeKeyVersions } from "./security.js";
 import { insertAudit, rateLimit } from "./db.js";
 import { assertBrowserWrite, forbidden, getWebActor, json, publicOrigin, sourceAddress, type WebActor } from "./http.js";
 import { handleManagementApi } from "./management.js";
 import { loadEffectiveOidcConfig, type SetupEnv } from "./bootstrap.js";
+import { assertProviderBaseUrlPublic, isCanonicalBuiltinProvider, isCustomProviderId, normalizeAndCheckProviderBaseUrl, normalizeProviderBaseUrl } from "./provider-registry.js";
 
 const SESSION_MAX_AGE = 12 * 60 * 60;
 const REFRESH_MAX_AGE = 30 * 24 * 60 * 60;
@@ -10,6 +12,7 @@ const CREDENTIAL_TTL = 30 * 24 * 60 * 60;
 const safeId = /^[A-Za-z0-9._:-]{1,128}$/;
 const providerId = /^[a-z][a-z0-9_-]{0,31}$/;
 const modelId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const upstreamModelId = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
 interface ModelPermission {
   provider: string;
@@ -238,6 +241,114 @@ export async function handleBrowserApi(request: Request, env: Env): Promise<Resp
     return json({ providers, credentials: credentials.results ?? [] });
   }
 
+  if (method === "POST" && path === "/api/providers") {
+    if (!actor.isAdmin) return forbidden();
+    if (!(await rateLimit(env.DB, "provider_registry_create", actor.userId, 10, 60))) return json({ error: "rate_limited" }, 429);
+    const body = await readJson(request, 8_192);
+    const fields = Object.keys(body);
+    if (fields.length !== 4 || !["id", "displayName", "baseUrl", "protocol"].every((field) => fields.includes(field)) ||
+        !text(body.id, 32) || !providerId.test(body.id) || !text(body.displayName, 80) || body.displayName.trim() !== body.displayName || /[\u0000-\u001f\u007f]/.test(body.displayName) ||
+        typeof body.baseUrl !== "string" || body.baseUrl.length < 1 || body.baseUrl.length > 2_048 || body.baseUrl.trim() !== body.baseUrl || body.protocol !== "openai") {
+      return json({ error: "invalid_request" }, 400);
+    }
+    const alreadyRegistered = await env.DB.prepare("SELECT 1 AS found FROM providers WHERE provider=?")
+      .bind(body.id).first<{ found: number }>();
+    if (alreadyRegistered) return json({ error: "provider_exists" }, 409);
+
+    let baseUrl: string;
+    try {
+      baseUrl = await normalizeAndCheckProviderBaseUrl(env, body.baseUrl);
+    } catch (error) {
+      return json({ error: "endpoint_not_allowed", ...(error instanceof ProviderEndpointSecurityError ? { reason: error.code, stage: error.stage } : {}) }, 400);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const inserted = await env.DB.prepare(
+      `INSERT INTO providers(provider,display_name,enabled,protocol,base_url,custom)
+       SELECT ?,?,1,'openai',?,1
+       WHERE EXISTS (
+         SELECT 1 FROM users u
+         JOIN user_allowlist a ON a.issuer=u.issuer AND a.subject=u.subject
+         JOIN sessions s ON s.user_id=u.id
+         WHERE u.id=? AND u.active=1 AND a.is_admin=1 AND a.revoked_at IS NULL
+           AND s.id=? AND s.kind='web' AND s.revoked_at IS NULL AND s.expires_at>?
+       ) AND (SELECT COUNT(*) FROM providers WHERE custom=1)<128
+       ON CONFLICT(provider) DO NOTHING
+       RETURNING provider,display_name,protocol,base_url,custom,enabled`,
+    ).bind(body.id, body.displayName, baseUrl, actor.userId, actor.sessionId, now)
+      .first<{ provider: string; display_name: string; protocol: "openai" | "anthropic"; base_url: string; custom: number; enabled: number }>();
+    if (!inserted) {
+      const existing = await env.DB.prepare("SELECT 1 AS found FROM providers WHERE provider=?").bind(body.id).first<{ found: number }>();
+      if (existing) return json({ error: "provider_exists" }, 409);
+      const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM providers WHERE custom=1").first<{ count: number }>();
+      if ((count?.count ?? 0) >= 128) return json({ error: "provider_limit_reached" }, 409);
+      return forbidden();
+    }
+    await insertAudit(env.DB, actor.userId, "provider.created", "provider", inserted.provider, { protocol: inserted.protocol });
+    return json({ provider: {
+      id: inserted.provider,
+      displayName: inserted.display_name,
+      baseUrl: inserted.base_url,
+      protocol: inserted.protocol,
+      custom: inserted.custom === 1,
+      enabled: inserted.enabled === 1,
+    } }, 201);
+  }
+
+  const providerMatch = path.match(/^\/api\/providers\/([a-z][a-z0-9_-]{0,31})$/);
+  if (providerMatch && method === "PUT") {
+    if (!actor.isAdmin) return forbidden();
+    if (!(await rateLimit(env.DB, "provider_registry_update", actor.userId, 10, 60))) return json({ error: "rate_limited" }, 429);
+    const body = await readJson(request, 2_048);
+    if (Object.keys(body).length !== 1 || typeof body.enabled !== "boolean") return json({ error: "invalid_request" }, 400);
+    const existingProvider = await env.DB.prepare(
+      "SELECT enabled,protocol,base_url AS baseUrl,custom FROM providers WHERE provider=?",
+    ).bind(providerMatch[1]!).first<{ enabled: number; protocol: "openai" | "anthropic"; baseUrl: string; custom: number }>();
+    if (!existingProvider) return json({ error: "not_found" }, 404);
+    if ((existingProvider.protocol !== "openai" && existingProvider.protocol !== "anthropic") ||
+        !(isCanonicalBuiltinProvider(providerMatch[1]!, existingProvider.protocol, existingProvider.baseUrl, existingProvider.custom) ||
+          isCustomProviderId(providerMatch[1]!, existingProvider.custom))) return forbidden();
+    if (body.enabled && existingProvider.custom === 1) {
+      try {
+        const normalized = normalizeProviderBaseUrl(env, existingProvider.baseUrl);
+        if (normalized !== existingProvider.baseUrl) return json({ error: "endpoint_not_allowed" }, 400);
+        await assertProviderBaseUrlPublic(normalized);
+      } catch {
+        return json({ error: "endpoint_not_allowed" }, 400);
+      }
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const updated = await env.DB.prepare(
+      `UPDATE providers SET enabled=? WHERE provider=? AND (
+        (custom=1 AND provider NOT IN ('openai','anthropic')) OR
+        (custom=0 AND (
+          (provider='openai' AND protocol='openai' AND base_url='https://api.openai.com/v1/') OR
+          (provider='anthropic' AND protocol='anthropic' AND base_url='https://api.anthropic.com/v1/')
+        ))
+      ) AND protocol=? AND base_url=? AND custom=? AND EXISTS (
+        SELECT 1 FROM users u
+        JOIN user_allowlist a ON a.issuer=u.issuer AND a.subject=u.subject
+        JOIN sessions s ON s.user_id=u.id
+        WHERE u.id=? AND u.active=1 AND a.is_admin=1 AND a.revoked_at IS NULL
+          AND s.id=? AND s.kind='web' AND s.revoked_at IS NULL AND s.expires_at>?
+      ) RETURNING provider,display_name,enabled,protocol,base_url,custom`,
+    ).bind(body.enabled ? 1 : 0, providerMatch[1]!, existingProvider.protocol, existingProvider.baseUrl, existingProvider.custom, actor.userId, actor.sessionId, now)
+      .first<{ provider: string; display_name: string; enabled: number; protocol: "openai" | "anthropic"; base_url: string; custom: number }>();
+    if (!updated) {
+      const exists = await env.DB.prepare("SELECT 1 AS found FROM providers WHERE provider=?").bind(providerMatch[1]!).first<{ found: number }>();
+      return exists ? forbidden() : json({ error: "not_found" }, 404);
+    }
+    await insertAudit(env.DB, actor.userId, updated.enabled ? "provider.enabled" : "provider.disabled", "provider", updated.provider);
+    return json({ provider: {
+      id: updated.provider,
+      displayName: updated.display_name,
+      baseUrl: updated.base_url,
+      protocol: updated.protocol,
+      custom: updated.custom === 1,
+      enabled: updated.enabled === 1,
+    } });
+  }
+
   if (method === "POST" && path === "/api/credentials") {
     const body = await readJson(request, 16_384);
     const projectId = body.projectId;
@@ -290,7 +401,7 @@ export async function handleBrowserApi(request: Request, env: Env): Promise<Resp
 
   if (method === "POST" && path === "/api/providers/models") {
     const body = await readJson(request);
-    if (!text(body.provider, 32) || !providerId.test(body.provider) || !text(body.alias, 128) || !modelId.test(body.alias) || !text(body.upstreamModel, 128) || !modelId.test(body.upstreamModel) || !text(body.displayName, 128)) return json({ error: "invalid_request" }, 400);
+    if (!text(body.provider, 32) || !providerId.test(body.provider) || !text(body.alias, 128) || !modelId.test(body.alias) || !text(body.upstreamModel, 128) || !upstreamModelId.test(body.upstreamModel) || !text(body.displayName, 128)) return json({ error: "invalid_request" }, 400);
     const provider = await env.DB.prepare("SELECT provider FROM providers WHERE provider = ? AND enabled = 1").bind(body.provider).first<{ provider: string }>();
     if (!provider) return json({ error: "provider_disallowed" }, 400);
     const { results: projects } = await env.DB.prepare("SELECT project_id FROM project_members WHERE user_id = ? AND role IN ('owner','admin')").bind(actor.userId).all<{ project_id: string }>();
@@ -445,8 +556,13 @@ export async function handleBrowserApi(request: Request, env: Env): Promise<Resp
 }
 
 async function getProviders(env: Env, projectId: string): Promise<Array<Record<string, unknown>>> {
-  const { results } = await env.DB.prepare("SELECT provider, display_name AS displayName, enabled FROM providers ORDER BY display_name").all<{ provider: string; displayName: string; enabled: number }>();
-  return Promise.all((results ?? []).map(async (provider) => {
+  const { results } = await env.DB.prepare(
+    "SELECT provider, display_name AS displayName, enabled, protocol, base_url AS baseUrl, custom FROM providers ORDER BY display_name",
+  ).all<{ provider: string; displayName: string; enabled: number; protocol: "openai" | "anthropic"; baseUrl: string; custom: number }>();
+  return Promise.all((results ?? []).filter((provider) =>
+    isCanonicalBuiltinProvider(provider.provider, provider.protocol, provider.baseUrl, provider.custom) ||
+    isCustomProviderId(provider.provider, provider.custom),
+  ).map(async (provider) => {
     const models = await env.DB.prepare(
       `SELECT pm.alias, pm.upstream_model AS upstreamModel, pm.display_name AS displayName, pm.enabled,
               CASE WHEN pp.project_id IS NULL THEN 0 ELSE 1 END AS projectAllowed
@@ -454,7 +570,13 @@ async function getProviders(env: Env, projectId: string): Promise<Array<Record<s
          ON pp.provider=pm.provider AND pp.model=pm.alias AND pp.project_id=?
        WHERE pm.provider=? ORDER BY pm.display_name`,
     ).bind(projectId, provider.provider).all<Record<string, unknown>>();
-    return { ...provider, enabled: provider.enabled === 1, models: models.results ?? [] };
+    return {
+      ...provider,
+      id: provider.provider,
+      enabled: provider.enabled === 1,
+      custom: provider.custom === 1,
+      models: models.results ?? [],
+    };
   }));
 }
 

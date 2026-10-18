@@ -11,6 +11,7 @@
   },
   "vars": {
     "GATEWAY_ENVIRONMENT": "local",
+    "GATEWAY_PUBLIC_ORIGIN": "http://localhost:8788",
     "MACHINE_ISSUER": "http://localhost:8787"
   },
   "secrets": {
@@ -32,6 +33,7 @@
       },
       "vars": {
         "GATEWAY_ENVIRONMENT": "staging",
+        "GATEWAY_PUBLIC_ORIGIN": "https://llm.gemslab.id.vn",
         "MACHINE_ISSUER": "https://llm.gemslab.id.vn"
       },
       "services": [

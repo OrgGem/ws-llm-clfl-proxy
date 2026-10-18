@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import { MAX_IN_FLIGHT, MAX_REQUEST_PAYLOAD_BYTES, MAX_SESSION_SECONDS, MIN_REQUEST_PAYLOAD_BYTES, MIN_SESSION_SECONDS } from "@ws-proxy/shared";
 import { ConfigStore, createInitialConfig } from "./config.js";
 import { fetchWithEnvironmentProxy } from "./proxy.js";
-import type { AdapterConfig, Provider } from "./types.js";
+import type { AdapterConfig, ProviderProtocol } from "./types.js";
 
 export type IdentityFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -27,7 +27,7 @@ export interface ClientBootstrap {
   gatewayUrl: string;
   client: { clientId: string; kind: "public" | "confidential" };
   projectId: string;
-  models: Array<{ id: string; provider: Provider }>;
+  models: Array<{ id: string; provider: string; protocol: ProviderProtocol }>;
   limits: { maxPayloadBytes: number; maxConcurrency: number; maxSessionSeconds: number };
 }
 
@@ -63,13 +63,24 @@ export function parseClientBootstrap(value: unknown): ClientBootstrap {
   if (!isIdentifier(value.projectId)) throw new IdentityError("Bootstrap projectId is invalid");
   if (!Array.isArray(value.models) || value.models.length > 256) throw new IdentityError("Bootstrap models must be a bounded array");
   const models = value.models.map((model) => {
-    if (!isExactRecord(model, ["id", "provider"]) || !isModelAlias(model.id)) {
+    const legacyShape = isExactRecord(model, ["id", "provider"]);
+    const explicitProtocolShape = isExactRecord(model, ["id", "provider", "protocol"]);
+    if ((!legacyShape && !explicitProtocolShape) || !isModelAlias(model.id)) {
       throw new IdentityError("Bootstrap model must contain a valid id and provider");
     }
-    if (model.provider !== "openai" && model.provider !== "anthropic") {
-      throw new IdentityError("Bootstrap model provider must be openai or anthropic");
+    if (!isProviderId(model.provider)) {
+      throw new IdentityError("Bootstrap model provider must be a valid provider ID");
     }
-    return { id: model.id, provider: model.provider as Provider };
+    const protocol = model.protocol === undefined && (model.provider === "openai" || model.provider === "anthropic")
+      ? model.provider
+      : model.protocol;
+    if (protocol !== "openai" && protocol !== "anthropic") {
+      throw new IdentityError("Custom bootstrap model providers require an explicit supported protocol");
+    }
+    if ((model.provider === "openai" || model.provider === "anthropic") && protocol !== model.provider) {
+      throw new IdentityError("Built-in bootstrap provider protocol must match its provider ID");
+    }
+    return { id: model.id, provider: model.provider, protocol: protocol as ProviderProtocol };
   });
   if (new Set(models.map((model) => model.id)).size !== models.length) throw new IdentityError("Bootstrap model IDs must be unique");
   if (!isExactRecord(value.limits, ["maxPayloadBytes", "maxConcurrency", "maxSessionSeconds"])) {
@@ -295,6 +306,10 @@ function isIdentifier(value: unknown): value is string {
 
 function isModelAlias(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128 && !/[\u0000-\u0020]/.test(value);
+}
+
+function isProviderId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(value);
 }
 
 function isIntegerInRange(value: unknown, minimum: number, maximum: number): value is number {

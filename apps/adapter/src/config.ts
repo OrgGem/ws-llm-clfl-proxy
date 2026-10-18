@@ -3,7 +3,7 @@ import { chmod, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseCredentialEnvelope } from "@ws-proxy/shared";
-import type { AdapterConfig, CredentialEnvelope, MachineAuth, ModelConfig, Provider } from "./types.js";
+import type { AdapterConfig, CredentialEnvelope, MachineAuth, ModelConfig, ProviderProtocol } from "./types.js";
 
 const DEFAULT_PORT = 43128;
 export class ConfigError extends Error {
@@ -98,8 +98,19 @@ function validateModel(value: unknown): ModelConfig {
   const id = nonEmptyString(value.id, "model.id");
   if (id.length > 128 || /[\u0000-\u0020]/.test(id)) throw new ConfigError("model.id must be at most 128 characters without whitespace");
   const provider = value.provider;
-  if (provider !== "openai" && provider !== "anthropic") throw new ConfigError("model.provider must be openai or anthropic");
-  return { id, provider: provider as Provider, credentialId: nonEmptyString(value.credentialId, "model.credentialId") };
+  if (typeof provider !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(provider)) {
+    throw new ConfigError("model.provider must be a valid provider ID");
+  }
+  const protocol = value.protocol === undefined && (provider === "openai" || provider === "anthropic")
+    ? provider
+    : value.protocol;
+  if (protocol !== "openai" && protocol !== "anthropic") {
+    throw new ConfigError("Custom model providers require protocol openai or anthropic");
+  }
+  if ((provider === "openai" || provider === "anthropic") && provider !== protocol) {
+    throw new ConfigError("Built-in provider protocol must match its provider ID");
+  }
+  return { id, provider, protocol: protocol as ProviderProtocol, credentialId: nonEmptyString(value.credentialId, "model.credentialId") };
 }
 
 function validateIdentityUrl(value: unknown): string {

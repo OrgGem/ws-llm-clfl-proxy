@@ -18,10 +18,19 @@ export function safeBootstrapMetadata(response) {
   if (response.models.length > 256) throw new TypeError("Client setup metadata has too many model grants");
   const models = response.models.map((model) => {
     if (!isRecord(model) || typeof model.id !== "string" || !model.id.trim()
-      || (model.provider !== "openai" && model.provider !== "anthropic")) {
+      || typeof model.provider !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(model.provider)) {
       throw new TypeError("Client setup metadata contains an invalid model grant");
     }
-    return { id: model.id, provider: model.provider };
+    const protocol = model.protocol === undefined && (model.provider === "openai" || model.provider === "anthropic")
+      ? model.provider
+      : model.protocol;
+    if (protocol !== "openai" && protocol !== "anthropic") {
+      throw new TypeError("Custom model grants require a supported protocol");
+    }
+    if ((model.provider === "openai" || model.provider === "anthropic") && protocol !== model.provider) {
+      throw new TypeError("Built-in provider protocol must match its provider ID");
+    }
+    return { id: model.id, provider: model.provider, protocol };
   });
   for (const key of ["maxPayloadBytes", "maxConcurrency", "maxSessionSeconds"]) {
     if (!Number.isInteger(limits[key])) throw new TypeError("Client setup metadata has invalid project limits");

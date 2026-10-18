@@ -2,6 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import type { GatewayAccessTokenClaims } from "@ws-proxy/shared";
 import { verifyMachineAccessToken } from "./security.js";
 import { getProjectLimits, type ProjectLimits } from "./management.js";
+import { isCanonicalBuiltinProvider, isCustomProviderId } from "./provider-registry.js";
 
 export interface AuthorizedPrincipal {
   userId: string;
@@ -17,6 +18,14 @@ export interface CredentialMetadata {
   provider: string;
   expiresAt: number;
   keyVersion: string;
+}
+
+export interface AuthorizedProvider {
+  id: string;
+  displayName: string;
+  protocol: "openai" | "anthropic";
+  baseUrl: string;
+  custom: boolean;
 }
 
 export interface IdentityValidationResult {
@@ -40,6 +49,7 @@ export interface IdentityAuthorizationResult {
   principal?: AuthorizedPrincipal;
   credentialMetadata?: CredentialMetadata;
   authorizedModel?: { alias: string; upstreamModel: string };
+  authorizedProvider?: AuthorizedProvider;
   limits?: ProjectLimits;
   reasonCode?: string;
 }
@@ -163,17 +173,38 @@ export class IdentityInternal extends WorkerEntrypoint<Env> {
     ) return { allowed: false, reasonCode: "credential_owner_mismatch" };
 
     const model = await this.env.DB.prepare(
-      `SELECT pm.alias, pm.upstream_model
+      `SELECT pm.alias, pm.upstream_model,p.provider AS provider_id,p.display_name AS provider_display_name,
+              p.protocol,p.base_url AS base_url,p.custom
        FROM providers p
        JOIN provider_models pm ON pm.provider = p.provider AND pm.enabled = 1
        JOIN project_permissions pp ON pp.provider = pm.provider AND pp.model = pm.alias
        JOIN client_permissions cp ON cp.provider = pm.provider AND cp.model = pm.alias
        WHERE p.provider = ? AND p.enabled = 1 AND pm.alias = ?
-         AND pp.project_id = ? AND cp.client_id = ?`,
+         AND pp.project_id = ? AND cp.client_id = ?
+         AND (
+           (p.custom = 1 AND p.provider NOT IN ('openai','anthropic')) OR
+           (p.custom = 0 AND (
+             (p.provider='openai' AND p.protocol='openai' AND p.base_url='https://api.openai.com/v1/') OR
+             (p.provider='anthropic' AND p.protocol='anthropic' AND p.base_url='https://api.anthropic.com/v1/')
+           ))
+         )`,
     )
       .bind(input.provider, input.model, validated.principal.projectId, validated.clientRowId)
-      .first<{ alias: string; upstream_model: string }>();
+      .first<{
+        alias: string;
+        upstream_model: string;
+        provider_id: string;
+        provider_display_name: string;
+        protocol: "openai" | "anthropic";
+        base_url: string;
+        custom: number;
+      }>();
     if (!model) return { allowed: false, reasonCode: "provider_or_model_not_allowed" };
+    if (
+      (model.protocol !== "openai" && model.protocol !== "anthropic") ||
+      !(isCanonicalBuiltinProvider(model.provider_id, model.protocol, model.base_url, model.custom) ||
+        isCustomProviderId(model.provider_id, model.custom))
+    ) return { allowed: false, reasonCode: "provider_or_model_not_allowed" };
 
     return {
       allowed: true,
@@ -187,6 +218,13 @@ export class IdentityInternal extends WorkerEntrypoint<Env> {
         keyVersion: credential.key_version,
       },
       authorizedModel: { alias: model.alias, upstreamModel: model.upstream_model },
+      authorizedProvider: {
+        id: model.provider_id,
+        displayName: model.provider_display_name,
+        protocol: model.protocol,
+        baseUrl: model.base_url,
+        custom: model.custom === 1,
+      },
       limits: await getProjectLimits(this.env, validated.principal.projectId),
     };
   }

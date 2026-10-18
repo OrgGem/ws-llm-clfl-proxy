@@ -95,6 +95,7 @@ const openSockets: WebSocket[] = [];
 let fixtures: { owner: UserFixture; other: UserFixture };
 let providerRequestCount = 0;
 let providerCancellationCount = 0;
+let dnsRequestCount = 0;
 let lastProviderRequest: ProviderStats["lastRequest"] = null;
 
 beforeEach(async () => {
@@ -102,6 +103,7 @@ beforeEach(async () => {
   await migrateIdentityDatabase(integrationEnv.DB);
   providerRequestCount = 0;
   providerCancellationCount = 0;
+  dnsRequestCount = 0;
   lastProviderRequest = null;
   vi.stubGlobal("fetch", mockProviderFetch);
   fixtures = await seedGatewayDatabase();
@@ -220,6 +222,81 @@ describe("Gateway and Identity Worker integration", () => {
     expect(await providerStats()).toMatchObject({ requests: 0, cancellations: 0 });
   });
 
+  it("routes a granted custom provider through its registry URL after public DNS validation", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const customProvider = "custom-openai";
+    const customAlias = "custom-model";
+    const baseUrl = "https://custom-provider.example.org/v1/";
+    const envelopeKeyConfig = JSON.parse(integrationEnv.ENVELOPE_KEYS) as { current: string; keys: Record<string, string> };
+    const envelopeKid = envelopeKeyConfig.current;
+    const envelopeKey = decodeBase64Url(envelopeKeyConfig.keys[envelopeKid]!);
+    const credentialId = randomId("cred");
+    const credentialExpiresAt = now + 3_600;
+    const envelope = await encryptCredentialEnvelope(
+      new TextEncoder().encode(randomProviderSecret()),
+      {
+        credentialId,
+        userId: fixtures.owner.id,
+        projectId: fixtures.owner.projectId,
+        provider: customProvider,
+        kid: envelopeKid,
+        exp: credentialExpiresAt,
+      },
+      envelopeKey,
+    );
+
+    await integrationEnv.DB.prepare(
+      "INSERT INTO providers(provider,display_name,enabled,protocol,base_url,custom) VALUES(?,?,1,'openai',?,1)",
+    ).bind(customProvider, "Custom OpenAI", baseUrl).run();
+    await integrationEnv.DB.prepare(
+      "INSERT INTO provider_models(provider,alias,upstream_model,display_name,enabled,created_at) VALUES(?,?,?,'Custom Model',1,?)",
+    ).bind(customProvider, customAlias, "org/custom-model", now).run();
+    await integrationEnv.DB.prepare(
+      "INSERT INTO project_permissions(project_id,provider,model,created_by,created_at) VALUES(?,?,?,?,?)",
+    ).bind(fixtures.owner.projectId, customProvider, customAlias, fixtures.owner.id, now).run();
+    await integrationEnv.DB.prepare(
+      "INSERT INTO client_permissions(client_id,provider,model,created_by,created_at) VALUES(?,?,?,?,?)",
+    ).bind(fixtures.owner.clientRowId, customProvider, customAlias, fixtures.owner.id, now).run();
+    await integrationEnv.DB.prepare(
+      "INSERT INTO credentials(id,user_id,project_id,provider,key_version,expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
+    ).bind(credentialId, fixtures.owner.id, fixtures.owner.projectId, customProvider, envelopeKid, credentialExpiresAt, now).run();
+
+    const token = await machineToken(fixtures.owner);
+    const identityBinding = (env as unknown as {
+      IDENTITY: { authorizeTokenRequest(input: { accessToken: string; credentialId: string; provider: string; model: string }): Promise<unknown> };
+    }).IDENTITY;
+    const authorization = await identityBinding.authorizeTokenRequest({ accessToken: token, credentialId, provider: customProvider, model: customAlias });
+    expect(authorization).toMatchObject({
+      allowed: true,
+      authorizedProvider: { id: customProvider, protocol: "openai", baseUrl, custom: true },
+      authorizedModel: { alias: customAlias, upstreamModel: "org/custom-model" },
+    });
+
+    const { socket, inbox } = await connectGateway(token);
+    expect((await inbox.next()).event).toBe("session.ready");
+    const requestId = crypto.randomUUID();
+    const frame = startFrame(requestId, customAlias, envelope, customProvider);
+    frame.payload = { messages: [{ role: "user", content: "custom provider request" }] };
+    socket.send(JSON.stringify(frame));
+
+    let terminal: ServerFrame | undefined;
+    while (!terminal) {
+      const response = await inbox.next();
+      if (response.event === "response.chunk") {
+        socket.send(JSON.stringify({ event: "request.start", op: "ack", requestId, ackSeq: response.seq }));
+      } else if (response.event === "response.end" || response.event === "response.error") {
+        terminal = response;
+      }
+    }
+    expect(terminal, JSON.stringify({ terminal, stats: await providerStats(), dnsRequestCount })).toMatchObject({ event: "response.end", requestId });
+    expect(dnsRequestCount).toBe(2);
+    expect(await providerStats()).toMatchObject({
+      requests: 1,
+      cancellations: 0,
+      lastRequest: { method: "POST", origin: "https://custom-provider.example.org", path: "/v1/chat/completions" },
+    });
+  });
+
   it("enforces current project and client model ACLs before provider access", async () => {
     await integrationEnv.DB.prepare("DELETE FROM client_permissions WHERE client_id = ? AND model = 'finite'")
       .bind(fixtures.owner.clientRowId)
@@ -280,11 +357,16 @@ describe("Gateway and Identity Worker integration", () => {
   });
 });
 
-function startFrame(requestId: string, model: string, envelope: UserFixture["envelope"]): Record<string, unknown> {
+function startFrame(
+  requestId: string,
+  model: string,
+  envelope: UserFixture["envelope"],
+  provider = "openai",
+): Record<string, unknown> {
   return {
     event: "request.start",
     requestId,
-    provider: "openai",
+    provider,
     model,
     envelope,
     payload: { messages: [{ role: "user", content: "integration request" }] },
@@ -417,10 +499,20 @@ async function sha256Base64Url(value: string): Promise<string> {
 }
 
 async function mockProviderFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  if (url.origin === "https://cloudflare-dns.com" && url.pathname === "/dns-query") {
+    dnsRequestCount += 1;
+    const type = url.searchParams.get("type");
+    const answer = type === "A"
+      ? [{ name: url.searchParams.get("name"), type: 1, TTL: 300, data: "1.1.1.1" }]
+      : type === "AAAA"
+        ? [{ name: url.searchParams.get("name"), type: 28, TTL: 300, data: "2606:4700:4700::1111" }]
+        : [];
+    return Response.json({ Status: 0, Answer: answer }, { headers: { "content-type": "application/dns-json" } });
+  }
   const request = new Request(input, init);
-  const url = new URL(request.url);
   lastProviderRequest = { method: request.method, origin: url.origin, path: url.pathname };
-  if (request.method !== "POST" || url.origin !== "https://api.openai.com" || url.pathname !== "/v1/chat/completions") {
+  if (request.method !== "POST" || !["https://api.openai.com", "https://custom-provider.example.org"].includes(url.origin) || url.pathname !== "/v1/chat/completions") {
     return Response.json({ error: "unexpected provider route" }, { status: 404 });
   }
 

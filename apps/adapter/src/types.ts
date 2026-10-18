@@ -1,6 +1,7 @@
 import type { CredentialEnvelope } from "@ws-proxy/shared";
 
-export type Provider = "openai" | "anthropic";
+export type Provider = string;
+export type ProviderProtocol = "openai" | "anthropic";
 export type { CredentialEnvelope } from "@ws-proxy/shared";
 
 export type MachineAuth =
@@ -10,6 +11,7 @@ export type MachineAuth =
 export interface ModelConfig {
   id: string;
   provider: Provider;
+  protocol: ProviderProtocol;
   credentialId: string;
 }
 

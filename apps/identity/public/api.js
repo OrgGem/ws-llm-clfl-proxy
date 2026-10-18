@@ -61,7 +61,7 @@ export function createApiClient({
       payload = undefined;
     }
     if (!response.ok) {
-      throw new ApiError(response.status, safeErrorMessage(response.status));
+      throw new ApiError(response.status, safeErrorMessage(response.status, payload, target.pathname));
     }
     return payload;
   }
@@ -97,7 +97,18 @@ export function createApiClient({
   };
 }
 
-function safeErrorMessage(status) {
+function safeErrorMessage(status, payload, pathname) {
+  const code = payload && typeof payload === "object" && typeof payload.error === "string" ? payload.error : "";
+  const providerRegistryPath = pathname === "/api/providers" || /^\/api\/providers\/[a-z][a-z0-9_-]{0,31}$/.test(pathname);
+  if (providerRegistryPath && status === 400 && code === "endpoint_not_allowed") {
+    return "Provider URL must use public HTTPS and resolve only to public addresses. Private, local, or insecure endpoints are blocked.";
+  }
+  if (pathname === "/api/providers" && status === 409 && code === "provider_exists") {
+    return "That provider ID is already registered. Provider IDs and endpoints are immutable; choose a new ID.";
+  }
+  if (pathname === "/api/providers" && status === 400 && code === "invalid_request") {
+    return "Provider details are invalid. Check the provider ID, name, URL, and OpenAI-compatible protocol.";
+  }
   if (status === 401) return "Your session expired. Sign in again.";
   if (status === 403) return "You do not have permission to make that change.";
   if (status === 404) return "This item is no longer available.";

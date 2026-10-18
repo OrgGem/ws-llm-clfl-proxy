@@ -67,6 +67,40 @@ describe("loopback OpenAI-compatible HTTP boundary", () => {
     expect(body.endsWith("data: [DONE]\n\n")).toBe(true);
   });
 
+  it("keeps a custom provider ID for Gateway authorization and converts by its explicit protocol", async () => {
+    const upstream = [
+      'data: {"choices":[{"index":0,"delta":{"content":"custom reply"},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n",
+    ].join("");
+    const gateway: GatewayExecutor = {
+      execute: async (input, callbacks) => {
+        expect(input.provider).toBe("vendor_x");
+        expect(input.model).toBe("vendor-chat");
+        expect(input.payload).toMatchObject({ messages: [{ role: "user", content: "hello" }], frequency_penalty: 0.3 });
+        await callbacks.onChunk(0, upstream);
+        await callbacks.onEnd({ event: "response.end", requestId: input.requestId, lastSeq: 0 });
+      },
+      close: () => undefined,
+    };
+    const { server, token } = await createServer(gateway, 2, {
+      id: "vendor-chat",
+      provider: "vendor_x",
+      protocol: "openai",
+      credentialId: "credential_test",
+    });
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "vendor-chat", messages: [{ role: "user", content: "hello" }], frequency_penalty: 0.3, stream: true }),
+    });
+
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(body).toContain('"content":"custom reply"');
+    expect(body.endsWith("data: [DONE]\n\n")).toBe(true);
+  });
+
   it("returns a sanitized Gateway failure without leaking its rejection message", async () => {
     const gateway: GatewayExecutor = {
       execute: async () => { throw new Error("secret key and private prompt"); },
@@ -120,7 +154,13 @@ describe("loopback OpenAI-compatible HTTP boundary", () => {
   });
 });
 
-async function createServer(gateway: GatewayExecutor, maxGatewaySessions = 2): Promise<{
+async function createServer(
+  gateway: GatewayExecutor,
+  maxGatewaySessions = 2,
+  model: { id: string; provider: string; protocol?: string; credentialId: string } = {
+    id: "local-chat", provider: "openai", credentialId: "credential_test",
+  },
+): Promise<{
   server: Awaited<ReturnType<typeof startAdapter>>;
   token: string;
 }> {
@@ -134,7 +174,7 @@ async function createServer(gateway: GatewayExecutor, maxGatewaySessions = 2): P
   });
   const configured = validateConfig({
     ...initial,
-    models: [{ id: "local-chat", provider: "openai", credentialId: "credential_test" }],
+    models: [model],
     envelopes: [{
       v: 1,
       alg: "A256GCM",
@@ -142,7 +182,7 @@ async function createServer(gateway: GatewayExecutor, maxGatewaySessions = 2): P
       credentialId: "credential_test",
       userId: "user_test",
       projectId: "project_test",
-      provider: "openai",
+      provider: model.provider,
       exp: Math.floor(Date.now() / 1000) + 3600,
       nonce: "AAAAAAAAAAAAAAAA",
       ciphertext: "AAAAAAAAAAAAAAAAAAAAAA",

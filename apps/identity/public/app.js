@@ -1260,6 +1260,55 @@ async function renderProviders() {
   const canWriteProject = canWriteCurrentProject();
   const isSystemAdmin = state.session?.user?.isAdmin === true;
 
+  const customProviderId = h("input", { className: "input", required: "", maxlength: 32, pattern: "[a-z][a-z0-9_-]{0,31}", autocomplete: "off", placeholder: "my_provider" });
+  const customProviderName = h("input", { className: "input", required: "", maxlength: 80, autocomplete: "off", placeholder: "My provider" });
+  const customProviderBaseUrl = h("input", { className: "input", type: "url", required: "", maxlength: 2048, autocomplete: "off", placeholder: "https://api.example.com/v1" });
+  const customProviderForm = isSystemAdmin ? h("form", { className: "panel", autocomplete: "off" },
+    h("div", { className: "panel-header" }, h("div", {}, h("h2", {}, "Add a custom provider"), h("p", { className: "panel-description" }, "Register a public HTTPS endpoint that implements the OpenAI chat completions API."))),
+    notice("Only a system administrator can register provider endpoints. The endpoint is immutable after registration; use a new provider ID to add a different endpoint. API keys use the existing encrypted credential form below.", "info"),
+    h("div", { className: "form-grid spaced-form-grid" },
+      field("Provider ID", customProviderId, "Lowercase ID used for credential ownership and model grants."),
+      field("Display name", customProviderName),
+      field("Base URL", customProviderBaseUrl, "Include the API path prefix. The service appends /chat/completions. Private, local, and insecure endpoints are blocked.", true),
+    ),
+    h("p", { className: "field-help" }, "Protocol: OpenAI-compatible. The registered URL is server-controlled and never comes from a model request."),
+    h("div", { className: "form-actions" }, h("button", { className: "button secondary", type: "submit", disabled: state.busy, "data-busy-disabled": "true" }, "Register provider")),
+  ) : null;
+  customProviderForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!customProviderForm.reportValidity()) return;
+    const id = customProviderId.value.trim();
+    const displayName = customProviderName.value.trim();
+    const baseUrl = customProviderBaseUrl.value.trim();
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id) || !displayName || !baseUrl) {
+      showInlineError(customProviderForm, new Error("Check the provider ID, display name, and HTTPS base URL."));
+      return;
+    }
+    if (providers.some((provider) => providerIdOf(provider) === id)) {
+      showInlineError(customProviderForm, new Error("That provider ID is already registered. Provider IDs and endpoints are immutable; choose a new ID."));
+      return;
+    }
+    let endpoint;
+    try { endpoint = new URL(baseUrl); } catch {
+      showInlineError(customProviderForm, new Error("Enter a valid HTTPS base URL."));
+      return;
+    }
+    if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+      showInlineError(customProviderForm, new Error("Provider URLs must use HTTPS and cannot contain credentials, query strings, or fragments."));
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.post("/api/providers", { id, displayName, baseUrl, protocol: "openai" });
+      setLiveMessage(`Custom provider ${displayName} registered.`);
+      await loadCurrentView();
+    } catch (error) {
+      showInlineError(customProviderForm, error);
+    } finally {
+      setBusy(false);
+    }
+  });
+
   const keyProvider = h("select", { className: "select", required: "" },
     h("option", { value: "" }, "Choose a provider"),
     ...enabledProviders.map((provider) => h("option", { value: providerIdOf(provider) }, display(provider.displayName, providerIdOf(provider)))),
@@ -1330,6 +1379,7 @@ async function renderProviders() {
 
   const modelCards = providers.map((provider) => {
     const providerId = providerIdOf(provider);
+    const providerIsEnabled = enabled(provider.enabled);
     const models = list(provider.models);
     const modelRows = models.map((model) => {
       const alias = display(model.alias, display(model.model, ""));
@@ -1338,7 +1388,7 @@ async function renderProviders() {
       const toggle = h("input", {
         type: "checkbox",
         checked: permitted,
-        disabled: !modelEnabled || !canWriteProject,
+        disabled: !providerIsEnabled || !modelEnabled || !canWriteProject,
         "aria-label": `Allow ${display(model.displayName, alias)} for this project`,
         onChange: async (event) => {
           const checkbox = event.currentTarget;
@@ -1349,7 +1399,7 @@ async function renderProviders() {
             await loadCurrentView();
           } catch (error) {
             checkbox.checked = !checkbox.checked;
-            checkbox.disabled = !modelEnabled || !canWriteProject;
+            checkbox.disabled = !providerIsEnabled || !modelEnabled || !canWriteProject;
             showInlineError(card, error);
           }
         },
@@ -1359,7 +1409,23 @@ async function renderProviders() {
         h("label", { className: "checkbox-option nowrap" }, toggle, h("span", {}, "Allowed")),
       );
     });
-    const card = panel(display(provider.displayName, providerId), `${modelEnabledText(provider)} · project model permissions`, modelRows.length ? h("div", { className: "list" }, ...modelRows) : emptyState("No models mapped", "Add an alias and upstream model below."));
+    const customRoute = provider.custom === true ? ` · OpenAI-compatible endpoint ${display(provider.baseUrl, "configured by administrator")}` : "";
+    const providerActions = isSystemAdmin && providerId ? h("button", {
+      type: "button",
+      className: `button ${providerIsEnabled ? "danger" : "secondary"} small`,
+      disabled: state.busy,
+      "data-busy-disabled": "true",
+      onClick: async () => {
+        const name = display(provider.displayName, providerId);
+        const nextEnabled = !providerIsEnabled;
+        if (!nextEnabled && !confirmAction(`Disable ${name}? Requests using this provider route will be denied. Existing keys and mappings will remain saved.`)) return;
+        await runAction(
+          () => api.put(`/api/providers/${encodeURIComponent(providerId)}`, { enabled: nextEnabled }),
+          `${name} provider route ${nextEnabled ? "enabled" : "disabled"}.`,
+        );
+      },
+    }, providerIsEnabled ? "Disable provider" : "Enable provider") : null;
+    const card = panel(display(provider.displayName, providerId), `${modelEnabledText(provider)}${customRoute} · project model permissions`, modelRows.length ? h("div", { className: "list" }, ...modelRows) : emptyState("No models mapped", "Add an alias and upstream model below."), providerActions);
     return card;
   });
 
@@ -1375,7 +1441,7 @@ async function renderProviders() {
     h("div", { className: "form-grid" },
       field("Provider", modelProvider),
       field("Model alias", alias, "The name project clients request."),
-      field("Upstream model", upstreamModel, "The model ID sent to the configured provider."),
+      field("Upstream model", upstreamModel, "The provider's upstream model ID may include /, for example org/model."),
       field("Display name", displayName),
     ),
     h("div", { className: "form-actions" }, h("button", { className: "button secondary", type: "submit" }, "Add mapping")),
@@ -1392,6 +1458,7 @@ async function renderProviders() {
 
   const providerContent = modelCards.length ? h("div", { className: "section-grid two" }, ...modelCards) : emptyState("No providers configured", "An administrator must configure provider routes before adding keys.", "↗");
   return [
+    ...(customProviderForm ? [customProviderForm] : []),
     canWriteProject ? keyForm : panel("Add a provider key", "Only project owners and admins can change provider credentials.", notice("Ask a project owner or admin to add or revoke provider credentials.", "info")),
     panel("Saved credentials", "Only credential metadata is shown. Raw provider keys are not stored in this list.", credentialList),
     providerContent,

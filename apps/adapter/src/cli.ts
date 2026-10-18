@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { configureConfidentialClient, createDeviceLabel, pairPublicClient, readClientBootstrapFile } from "./auth.js";
 import { ConfigError, ConfigStore, defaultConfigPath, validateConfig } from "./config.js";
-import type { CredentialEnvelope, Provider } from "./types.js";
+import type { CredentialEnvelope, ProviderProtocol } from "./types.js";
 import { startAdapter } from "./server.js";
 
 const HELP = `OpenAI-compatible local adapter
@@ -12,7 +12,7 @@ Commands:
   configure-machine --identity-url URL --gateway-url WSS_URL --client-id ID
   configure-bootstrap FILE
   envelope add FILE
-  model add --id ALIAS --provider openai|anthropic --credential-id ID
+  model add --id ALIAS --provider PROVIDER_ID [--protocol openai|anthropic] --credential-id ID
   model list
   token
   serve
@@ -87,7 +87,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           });
           process.stdout.write("Confidential bootstrap configured with owner-only local state.\n");
         }
-        process.stdout.write(`Bootstrap project: ${bootstrap.projectId}\nAuthorized aliases: ${bootstrap.models.map((model) => `${model.id} (${model.provider})`).join(", ") || "none"}\n`);
+        process.stdout.write(`Bootstrap project: ${bootstrap.projectId}\nAuthorized aliases: ${bootstrap.models.map((model) => `${model.id} (${model.provider}/${model.protocol})`).join(", ") || "none"}\n`);
         process.stdout.write("Import an encrypted envelope, then map an authorized alias with `model add`. Bootstrap data contains no credential secret or envelope.\n");
         return;
       }
@@ -115,16 +115,25 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       case "model": {
         if (args[0] === "list" && args.length === 1) {
           const config = await store.load();
-          for (const model of config.models) process.stdout.write(`${model.id}\t${model.provider}\n`);
+          for (const model of config.models) process.stdout.write(`${model.id}\t${model.provider}\t${model.protocol}\n`);
           return;
         }
         if (args[0] !== "add") throw new ConfigError("Usage: model add --id ALIAS --provider openai|anthropic --credential-id ID");
         const options = parseOptions(args.slice(1));
         const provider = requiredOption(options, "provider");
-        if (provider !== "openai" && provider !== "anthropic") throw new ConfigError("--provider must be openai or anthropic");
+        if (!/^[a-z][a-z0-9_-]{0,31}$/.test(provider)) throw new ConfigError("--provider must be a valid provider ID");
+        const protocolOption = options.get("protocol");
+        const protocol = protocolOption ?? (provider === "openai" || provider === "anthropic" ? provider : undefined);
+        if (protocol !== "openai" && protocol !== "anthropic") {
+          throw new ConfigError("Custom providers require --protocol openai or --protocol anthropic");
+        }
+        if ((provider === "openai" || provider === "anthropic") && protocol !== provider) {
+          throw new ConfigError("The built-in provider protocol must match --provider");
+        }
         const model = {
           id: requiredOption(options, "id"),
-          provider: provider as Provider,
+          provider,
+          protocol: protocol as ProviderProtocol,
           credentialId: requiredOption(options, "credential-id"),
         };
         await store.update((current) => validateConfig({ ...current, models: [...current.models.filter((item) => item.id !== model.id), model] }));

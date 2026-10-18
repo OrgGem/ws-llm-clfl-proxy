@@ -1,6 +1,7 @@
 import { applyD1Migrations } from "cloudflare:test";
 import identityMigrationSql from "../apps/identity/migrations/0001_identity.sql?raw";
 import setupMigrationSql from "../apps/identity/migrations/0002_bootstrap_setup.sql?raw";
+import providerRegistryMigrationSql from "../apps/identity/migrations/0003_provider_registry.sql?raw";
 
 function migrationQueries(sql: string): string[] {
   return sql
@@ -10,10 +11,18 @@ function migrationQueries(sql: string): string[] {
 }
 
 export async function migrateIdentityDatabase(db: D1Database): Promise<void> {
-  await applyD1Migrations(db, [
+  const migrations = [
     { name: "0001_identity.sql", queries: migrationQueries(identityMigrationSql) },
     { name: "0002_bootstrap_setup.sql", queries: migrationQueries(setupMigrationSql) },
-  ]);
+    { name: "0003_provider_registry.sql", queries: migrationQueries(providerRegistryMigrationSql) },
+  ];
+  for (const migration of migrations) {
+    try {
+      await applyD1Migrations(db, [migration]);
+    } catch (cause) {
+      throw new Error(`Failed to apply ${migration.name}`, { cause });
+    }
+  }
 }
 
 export function decodeBase64Url(value: string): Uint8Array {

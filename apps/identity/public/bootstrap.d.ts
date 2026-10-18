@@ -4,7 +4,7 @@ export interface BootstrapMetadata {
   gatewayUrl: string;
   client: { clientId: string; kind: "confidential" | "public" };
   projectId: string;
-  models: Array<{ id: string; provider: "openai" | "anthropic" }>;
+  models: Array<{ id: string; provider: string; protocol: "openai" | "anthropic" }>;
   limits: { maxPayloadBytes: number; maxConcurrency: number; maxSessionSeconds: number };
 }
 

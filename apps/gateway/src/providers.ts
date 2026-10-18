@@ -1,8 +1,28 @@
-export type ProviderId = "openai" | "anthropic";
+export type ProviderProtocol = "openai" | "anthropic";
+export type ProviderId = ProviderProtocol;
+
+export interface BuiltinProvider {
+  protocol: ProviderProtocol;
+  baseUrl: string;
+  endpoint: string;
+}
+
+export const BUILTIN_PROVIDERS: Readonly<Record<ProviderId, BuiltinProvider>> = Object.freeze({
+  openai: {
+    protocol: "openai",
+    baseUrl: "https://api.openai.com/v1/",
+    endpoint: "https://api.openai.com/v1/chat/completions",
+  },
+  anthropic: {
+    protocol: "anthropic",
+    baseUrl: "https://api.anthropic.com/v1/",
+    endpoint: "https://api.anthropic.com/v1/messages",
+  },
+});
 
 export const PROVIDER_ENDPOINTS: Readonly<Record<ProviderId, string>> = Object.freeze({
-  openai: "https://api.openai.com/v1/chat/completions",
-  anthropic: "https://api.anthropic.com/v1/messages",
+  openai: BUILTIN_PROVIDERS.openai.endpoint,
+  anthropic: BUILTIN_PROVIDERS.anthropic.endpoint,
 });
 
 const SAFE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
@@ -24,11 +44,15 @@ export function isProviderId(value: string): value is ProviderId {
   return value === "openai" || value === "anthropic";
 }
 
+export function isProviderProtocol(value: unknown): value is ProviderProtocol {
+  return value === "openai" || value === "anthropic";
+}
+
 export function validateUpstreamModel(model: string): boolean {
   return SAFE_MODEL_ID.test(model);
 }
 
-export function providerKeyFromBytes(provider: ProviderId, plaintext: Uint8Array): string {
+export function providerKeyFromBytes(protocol: ProviderProtocol, plaintext: Uint8Array): string {
   if (plaintext.byteLength === 0 || plaintext.byteLength > MAX_PROVIDER_KEY_BYTES) {
     throw new TypeError("Provider credential has an invalid size");
   }
@@ -37,8 +61,8 @@ export function providerKeyFromBytes(provider: ProviderId, plaintext: Uint8Array
   if (key.trim() !== key || /[\u0000-\u001f\u007f]/.test(key)) {
     throw new TypeError("Provider credential has invalid characters");
   }
-  if (provider !== "openai" && provider !== "anthropic") {
-    throw new TypeError("Provider is not supported");
+  if (!isProviderProtocol(protocol)) {
+    throw new TypeError("Provider protocol is not supported");
   }
   return key;
 }
@@ -48,8 +72,14 @@ export interface ProviderRequest {
   init: RequestInit;
 }
 
+/**
+ * Build a fixed-method provider request against an already validated endpoint.
+ * Endpoint selection and custom-host validation happen in the Gateway session,
+ * using Identity's authorized provider registry result.
+ */
 export function buildProviderRequest(
-  provider: ProviderId,
+  protocol: ProviderProtocol,
+  endpoint: string,
   apiKey: string,
   upstreamModel: string,
   payload: Record<string, unknown>,
@@ -59,11 +89,23 @@ export function buildProviderRequest(
     throw new TypeError("Authorized upstream model is invalid");
   }
 
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new TypeError("Authorized provider endpoint is invalid");
+  }
+  const expectedSuffix = protocol === "openai" ? "/chat/completions" : "/messages";
+  if (!isProviderProtocol(protocol) || url.protocol !== "https:" || url.username || url.password ||
+      url.search || url.hash || !url.pathname.endsWith(expectedSuffix)) {
+    throw new TypeError("Authorized provider endpoint is invalid");
+  }
+
   const headers = new Headers({
     "content-type": "application/json",
     accept: "text/event-stream",
   });
-  if (provider === "openai") {
+  if (protocol === "openai") {
     headers.set("authorization", `Bearer ${apiKey}`);
   } else {
     headers.set("x-api-key", apiKey);
@@ -76,7 +118,7 @@ export function buildProviderRequest(
   }
 
   return {
-    url: PROVIDER_ENDPOINTS[provider],
+    url: url.toString(),
     init: {
       method: "POST",
       headers,

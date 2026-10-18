@@ -8,6 +8,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "source": "./src/index.ts"
+    },
+    "./provider-config": {
+      "types": "./dist/provider-config.d.ts",
+      "import": "./dist/provider-config.js",
+      "source": "./src/provider-config.ts"
     }
   },
   "scripts": {
@@ -15,6 +20,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "ipaddr.js": "^2.5.0",
     "jose": "^6.2.12",
     "zod": "^4.6.7"
   }

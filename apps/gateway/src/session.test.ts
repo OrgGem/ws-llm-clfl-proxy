@@ -3,7 +3,7 @@ import { encryptCredentialEnvelope, ACK_TIMEOUT_MS } from "@ws-proxy/shared";
 import { boundedProjectLimits, GatewaySession, splitUtf8, validateIdentityClaims } from "./session.js";
 import { buildProviderRequest } from "./providers.js";
 import { issuerConfigurationIsValid } from "./index.js";
-import type { GatewayDependencies, IdentityInternalBinding, MachineClaims, ProjectLimits } from "./types.js";
+import type { AuthorizedProvider, GatewayDependencies, IdentityInternalBinding, MachineClaims, ProjectLimits } from "./types.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -85,12 +85,12 @@ function validClaims(): MachineClaims {
   };
 }
 
-async function makeEnvelope(userId = "user-a", projectId = "project-a") {
+async function makeEnvelope(userId = "user-a", projectId = "project-a", provider = "openai") {
   return await encryptCredentialEnvelope(encoder.encode("sk-test-provider-key"), {
     credentialId: "credential-a",
     userId,
     projectId,
-    provider: "openai",
+    provider,
     kid: "key-v1",
     exp: fixtureCredentialExpiresAt,
   }, envelopeKey);
@@ -115,6 +115,7 @@ interface TestSession {
     authorizeTokenRequest: ReturnType<typeof vi.fn>;
   };
   fetcher: ReturnType<typeof vi.fn>;
+  endpointDnsFetcher: ReturnType<typeof vi.fn>;
 }
 
 function createSession(options: {
@@ -125,8 +126,21 @@ function createSession(options: {
   requestLimits?: ProjectLimits;
   credentialExpiresAt?: number;
   envelopeKeys?: string;
+  providerRegistry?: AuthorizedProvider | null;
+  credentialProvider?: string;
+  endpointDnsFetcher?: typeof fetch;
+  gatewayOrigin?: string;
 } = {}): TestSession {
   const claims = options.claims ?? validClaims();
+  const providerRegistry = options.providerRegistry === undefined
+    ? {
+        id: "openai",
+        displayName: "OpenAI",
+        protocol: "openai" as const,
+        baseUrl: "https://api.openai.com/v1/",
+        custom: false,
+      }
+    : options.providerRegistry;
   const identity = {
     fetch: vi.fn(),
     validateToken: vi.fn(async () => ({ valid: true, claims })),
@@ -142,11 +156,12 @@ function createSession(options: {
         credentialId: "credential-a",
         userId: claims.sub,
         projectId: claims.project_id,
-        provider: "openai",
+        provider: providerRegistry?.id ?? options.credentialProvider ?? "openai",
         expiresAt: options.credentialExpiresAt ?? fixtureCredentialExpiresAt,
         keyVersion: "key-v1",
       },
       authorizedModel: { alias: "fast-chat", upstreamModel: "gpt-4o-mini" },
+      ...(providerRegistry ? { authorizedProvider: providerRegistry } : {}),
       ...(options.requestLimits ? { limits: options.requestLimits } : {}),
     }))),
   };
@@ -160,16 +175,26 @@ function createSession(options: {
     { headers: { "content-type": "text/event-stream" } },
   )));
   const socket = new MemorySocket();
+  const endpointDnsFetcher = vi.fn(options.endpointDnsFetcher ?? (async (input: RequestInfo | URL) => {
+    const query = new URL(String(input)).searchParams;
+    const isV6 = query.get("type") === "AAAA" || query.get("type") === "28";
+    return Response.json({
+      Status: 0,
+      Answer: [{ type: isV6 ? 28 : 1, data: isV6 ? "2606:4700:4700::1111" : "1.1.1.1" }],
+    });
+  }));
   const dependencies: GatewayDependencies = {
     identity: identity as unknown as IdentityInternalBinding,
     machineIssuer: issuer,
     envelopeKeys: options.envelopeKeys ?? JSON.stringify({ current: "key-v1", keys: { "key-v1": base64Url(envelopeKey) } }),
     fetcher: fetcher as unknown as typeof fetch,
+    endpointDnsFetcher: endpointDnsFetcher as unknown as typeof fetch,
+    ...(options.gatewayOrigin ? { gatewayOrigin: options.gatewayOrigin } : {}),
   };
   const context = { waitUntil: (promise: Promise<unknown>) => { void promise.catch(() => undefined); } };
   const session = new GatewaySession(socket as unknown as WebSocket, "signed-token", claims, dependencies, context, options.sessionLimits);
   session.attach();
-  return { session, socket, identity, fetcher };
+  return { session, socket, identity, fetcher, endpointDnsFetcher };
 }
 
 async function waitForFrame(
@@ -186,11 +211,11 @@ async function waitForFrame(
   throw new Error(`Timed out waiting for Gateway frame; saw ${JSON.stringify(socket.frames())}`);
 }
 
-function startFrame(id: number, envelope: unknown): Record<string, unknown> {
+function startFrame(id: number, envelope: unknown, provider = "openai"): Record<string, unknown> {
   return {
     event: "request.start",
     requestId: requestId(id),
-    provider: "openai",
+    provider,
     model: "fast-chat",
     envelope,
     payload: { messages: [{ role: "user", content: "hello" }] },
@@ -212,6 +237,305 @@ describe("GatewaySession", () => {
     expect(terminal).toMatchObject({ event: "response.error", requestId: id, code: "forbidden", upstreamStarted: false });
     expect(denied.fetcher).not.toHaveBeenCalled();
     denied.socket.peerClose();
+  });
+
+  it("routes a registered custom OpenAI-compatible provider and rechecks Identity after DNS", async () => {
+    const registry: AuthorizedProvider = {
+      id: "acme-llm",
+      displayName: "Acme LLM",
+      protocol: "openai",
+      baseUrl: "https://llm.example.net/gateway/v1/",
+      custom: true,
+    };
+    const dnsFetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? new URL(input.url) : new URL(String(input));
+      const isV6 = url.searchParams.get("type") === "AAAA" || url.searchParams.get("type") === "28";
+      return Response.json({
+        Status: 0,
+        Answer: [{ type: isV6 ? 28 : 1, data: isV6 ? "2606:4700:4700::1111" : "1.1.1.1" }],
+      });
+    });
+    const test = createSession({ providerRegistry: registry, endpointDnsFetcher: dnsFetcher as typeof fetch });
+    const id = requestId(80);
+    test.socket.emitMessage(JSON.stringify(startFrame(80, await makeEnvelope("user-a", "project-a", registry.id), registry.id)));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.end" && frame.requestId === id);
+    expect(terminal).toMatchObject({ event: "response.end", requestId: id });
+    expect(test.identity.authorizeTokenRequest).toHaveBeenCalledTimes(2);
+    expect(dnsFetcher).toHaveBeenCalledTimes(2);
+    expect(test.fetcher).toHaveBeenCalledOnce();
+    expect(test.fetcher.mock.calls[0]?.[0]).toBe("https://llm.example.net/gateway/v1/chat/completions");
+    const init = test.fetcher.mock.calls[0]?.[1] as RequestInit;
+    expect(init.redirect).toBe("manual");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer sk-test-provider-key");
+    const chunks = test.socket.frames().filter((frame) => frame.event === "response.chunk" && frame.requestId === id);
+    if (chunks.length > 0) {
+      test.socket.emitMessage(JSON.stringify({ event: "request.start", op: "ack", requestId: id, ackSeq: chunks.length - 1 }));
+    }
+    test.socket.peerClose();
+  });
+
+  it("routes a registered custom Anthropic-compatible provider to its fixed operation path", async () => {
+    const registry: AuthorizedProvider = {
+      id: "anthropic-edge",
+      displayName: "Anthropic Edge",
+      protocol: "anthropic",
+      baseUrl: "https://anthropic.example.net/anthropic/v1/",
+      custom: true,
+    };
+    const test = createSession({ providerRegistry: registry });
+    const id = requestId(89);
+    test.socket.emitMessage(JSON.stringify(startFrame(89, await makeEnvelope("user-a", "project-a", registry.id), registry.id)));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.end" && frame.requestId === id);
+    expect(terminal).toMatchObject({ event: "response.end", requestId: id });
+    expect(test.fetcher).toHaveBeenCalledOnce();
+    expect(test.fetcher.mock.calls[0]?.[0]).toBe("https://anthropic.example.net/anthropic/v1/messages");
+    const init = test.fetcher.mock.calls[0]?.[1] as RequestInit;
+    const headers = new Headers(init.headers);
+    expect(init.redirect).toBe("manual");
+    expect(headers.get("x-api-key")).toBe("sk-test-provider-key");
+    expect(headers.get("anthropic-version")).toBe("2023-06-01");
+    expect(headers.get("authorization")).toBeNull();
+    test.socket.peerClose();
+  });
+
+  it("uses only the fixed built-in endpoint when older Identity fixtures omit provider metadata", async () => {
+    const test = createSession({ providerRegistry: null, credentialProvider: "openai" });
+    const id = requestId(90);
+    test.socket.emitMessage(JSON.stringify(startFrame(90, await makeEnvelope())));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.end" && frame.requestId === id);
+    expect(terminal).toMatchObject({ event: "response.end", requestId: id });
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/chat/completions");
+    test.socket.peerClose();
+  });
+
+  it("rejects a custom provider whose route changes during the post-DNS Identity check", async () => {
+    const registry: AuthorizedProvider = {
+      id: "changing-llm",
+      displayName: "Changing LLM",
+      protocol: "openai",
+      baseUrl: "https://llm.example.net/v1/",
+      custom: true,
+    };
+    const claims = validClaims();
+    let calls = 0;
+    const authorize = () => {
+      calls += 1;
+      return {
+        allowed: true,
+        principal: { userId: claims.sub, projectId: claims.project_id, clientId: claims.client_id, sessionId: claims.sid },
+        credentialMetadata: {
+          credentialId: "credential-a",
+          userId: claims.sub,
+          projectId: claims.project_id,
+          provider: registry.id,
+          expiresAt: fixtureCredentialExpiresAt,
+          keyVersion: "key-v1",
+        },
+        authorizedModel: { alias: "fast-chat", upstreamModel: "gpt-4o-mini" },
+        authorizedProvider: calls === 1 ? registry : { ...registry, baseUrl: "https://changed.example.net/v1/" },
+      };
+    };
+    const test = createSession({ providerRegistry: registry, authorize });
+    const envelope = await makeEnvelope("user-a", "project-a", registry.id);
+    const tampered = { ...envelope };
+    const index = Math.floor(tampered.ciphertext.length / 2);
+    tampered.ciphertext = `${tampered.ciphertext.slice(0, index)}${tampered.ciphertext[index] === "A" ? "B" : "A"}${tampered.ciphertext.slice(index + 1)}`;
+    const id = requestId(84);
+    test.socket.emitMessage(JSON.stringify(startFrame(84, tampered, registry.id)));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false, retryable: false });
+    expect(test.identity.authorizeTokenRequest).toHaveBeenCalledTimes(2);
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("does not decrypt or launch upstream if cancelled while custom DNS validation is pending", async () => {
+    const registry: AuthorizedProvider = {
+      id: "slow-dns-llm",
+      displayName: "Slow DNS LLM",
+      protocol: "openai",
+      baseUrl: "https://llm.example.net/v1/",
+      custom: true,
+    };
+    const dnsResolvers: Array<(response: Response) => void> = [];
+    const dnsFetcher = vi.fn(() => new Promise<Response>((resolve) => dnsResolvers.push(resolve)));
+    const test = createSession({ providerRegistry: registry, endpointDnsFetcher: dnsFetcher as typeof fetch });
+    const envelope = await makeEnvelope("user-a", "project-a", registry.id);
+    const tampered = { ...envelope };
+    const index = Math.floor(tampered.ciphertext.length / 2);
+    tampered.ciphertext = `${tampered.ciphertext.slice(0, index)}${tampered.ciphertext[index] === "A" ? "B" : "A"}${tampered.ciphertext.slice(index + 1)}`;
+    const id = requestId(85);
+    test.socket.emitMessage(JSON.stringify(startFrame(85, tampered, registry.id)));
+    const waitUntilDnsStarted = Date.now() + 2_000;
+    while (dnsFetcher.mock.calls.length < 2 && Date.now() < waitUntilDnsStarted) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    expect(dnsFetcher).toHaveBeenCalledTimes(2);
+    test.socket.emitMessage(JSON.stringify({ event: "request.cancel", requestId: id }));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "cancelled", upstreamStarted: false, retryable: false });
+    expect(test.fetcher).not.toHaveBeenCalled();
+    for (const resolve of dnsResolvers) {
+      resolve(Response.json({ Status: 0, Answer: [{ type: 1, data: "1.1.1.1" }] }));
+    }
+    test.socket.peerClose();
+  });
+
+  it("does not decrypt or launch upstream when a custom DNS check finishes after token expiry", async () => {
+    const registry: AuthorizedProvider = {
+      id: "expiring-dns-llm",
+      displayName: "Expiring DNS LLM",
+      protocol: "openai",
+      baseUrl: "https://llm.example.net/v1/",
+      custom: true,
+    };
+    const claims = validClaims();
+    claims.exp = Math.floor(Date.now() / 1000) + 1;
+    const dnsResolvers: Array<(response: Response) => void> = [];
+    const dnsFetcher = vi.fn(() => new Promise<Response>((resolve) => dnsResolvers.push(resolve)));
+    const test = createSession({ providerRegistry: registry, claims, endpointDnsFetcher: dnsFetcher as typeof fetch });
+    const envelope = await makeEnvelope("user-a", "project-a", registry.id);
+    const tampered = { ...envelope };
+    const index = Math.floor(tampered.ciphertext.length / 2);
+    tampered.ciphertext = `${tampered.ciphertext.slice(0, index)}${tampered.ciphertext[index] === "A" ? "B" : "A"}${tampered.ciphertext.slice(index + 1)}`;
+    const id = requestId(86);
+    test.socket.emitMessage(JSON.stringify(startFrame(86, tampered, registry.id)));
+    const waitUntilDnsStarted = Date.now() + 2_000;
+    while (dnsFetcher.mock.calls.length < 2 && Date.now() < waitUntilDnsStarted) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    expect(dnsFetcher).toHaveBeenCalledTimes(2);
+    while (Date.now() < claims.exp * 1000) await new Promise((resolve) => setTimeout(resolve, 10));
+    for (const resolve of dnsResolvers) {
+      resolve(Response.json({ Status: 0, Answer: [{ type: 1, data: "1.1.1.1" }] }));
+    }
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "session_expired", upstreamStarted: false, retryable: false });
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects an unknown provider ID without a matching Identity registry record", async () => {
+    const test = createSession({ providerRegistry: null, credentialProvider: "unknown-provider" });
+    const id = requestId(81);
+    test.socket.emitMessage(JSON.stringify(startFrame(81, await makeEnvelope("user-a", "project-a", "unknown-provider"), "unknown-provider")));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false, retryable: false });
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("does not use the built-in fallback for a custom ID missing Identity provider metadata", async () => {
+    const test = createSession({ providerRegistry: null, credentialProvider: "custom-llm" });
+    const id = requestId(87);
+    test.socket.emitMessage(JSON.stringify(startFrame(87, await makeEnvelope("user-a", "project-a", "custom-llm"), "custom-llm")));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false, retryable: false });
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects the Identity service origin as a custom upstream", async () => {
+    const registry: AuthorizedProvider = {
+      id: "self-target-llm",
+      displayName: "Self Target LLM",
+      protocol: "openai",
+      baseUrl: "https://identity.example.test/v1/",
+      custom: true,
+    };
+    const test = createSession({ providerRegistry: registry });
+    const id = requestId(88);
+    test.socket.emitMessage(JSON.stringify(startFrame(88, await makeEnvelope("user-a", "project-a", registry.id), registry.id)));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false, retryable: false });
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects a configured Gateway origin as a custom upstream", async () => {
+    const registry: AuthorizedProvider = {
+      id: "gateway-self-target-llm",
+      displayName: "Gateway Self Target LLM",
+      protocol: "openai",
+      baseUrl: "https://gateway.example.test/v1/",
+      custom: true,
+    };
+    const test = createSession({ providerRegistry: registry, gatewayOrigin: "wss://gateway.example.test" });
+    const id = requestId(91);
+    test.socket.emitMessage(JSON.stringify(startFrame(91, await makeEnvelope("user-a", "project-a", registry.id), registry.id)));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false, retryable: false });
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects a hostile registry endpoint before decrypting or resolving it", async () => {
+    const registry: AuthorizedProvider = {
+      id: "hostile-llm",
+      displayName: "Hostile LLM",
+      protocol: "openai",
+      baseUrl: "http://127.0.0.1/v1/",
+      custom: true,
+    };
+    const envelope = await makeEnvelope("user-a", "project-a", registry.id);
+    const tampered = { ...envelope };
+    const index = Math.floor(tampered.ciphertext.length / 2);
+    tampered.ciphertext = `${tampered.ciphertext.slice(0, index)}${tampered.ciphertext[index] === "A" ? "B" : "A"}${tampered.ciphertext.slice(index + 1)}`;
+    const test = createSession({ providerRegistry: registry });
+    const id = requestId(82);
+    test.socket.emitMessage(JSON.stringify(startFrame(82, tampered, registry.id)));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false, retryable: false });
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects custom hosts resolving to private IPs before decrypting or calling upstream", async () => {
+    const registry: AuthorizedProvider = {
+      id: "private-llm",
+      displayName: "Private LLM",
+      protocol: "openai",
+      baseUrl: "https://llm.example.net/v1/",
+      custom: true,
+    };
+    const dnsFetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? new URL(input.url) : new URL(String(input));
+      const isV6 = url.searchParams.get("type") === "AAAA" || url.searchParams.get("type") === "28";
+      return Response.json({
+        Status: 0,
+        Answer: [{ type: isV6 ? 28 : 1, data: isV6 ? "fd00::1" : "10.0.0.7" }],
+      });
+    });
+    const envelope = await makeEnvelope("user-a", "project-a", registry.id);
+    const tampered = { ...envelope };
+    const index = Math.floor(tampered.ciphertext.length / 2);
+    tampered.ciphertext = `${tampered.ciphertext.slice(0, index)}${tampered.ciphertext[index] === "A" ? "B" : "A"}${tampered.ciphertext.slice(index + 1)}`;
+    const test = createSession({ providerRegistry: registry, endpointDnsFetcher: dnsFetcher as typeof fetch });
+    const id = requestId(83);
+    test.socket.emitMessage(JSON.stringify(startFrame(83, tampered, registry.id)));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ code: "provider_disallowed", upstreamStarted: false, retryable: false });
+    expect(dnsFetcher).toHaveBeenCalledTimes(2);
+    expect(test.identity.authorizeTokenRequest).toHaveBeenCalledOnce();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
   });
 
   it("classifies authenticated ciphertext tampering as an invalid credential", async () => {
@@ -560,13 +884,13 @@ describe("Gateway boundaries", () => {
   });
 
   it("uses a fixed provider endpoint and rejects an oversized JSON body", () => {
-    const request = buildProviderRequest("openai", "sk-test", "gpt-4o-mini", { messages: [] }, new AbortController().signal);
+    const request = buildProviderRequest("openai", "https://api.openai.com/v1/chat/completions", "sk-test", "gpt-4o-mini", { messages: [] }, new AbortController().signal);
     expect(request.url).toBe("https://api.openai.com/v1/chat/completions");
     expect(request.init.redirect).toBe("manual");
     expect(new Headers(request.init.headers).get("authorization")).toBe("Bearer sk-test");
     expect(new Headers(request.init.headers).get("x-api-key")).toBeNull();
     expect(JSON.parse(String(request.init.body))).toMatchObject({ model: "gpt-4o-mini", stream: true });
-    const anthropic = buildProviderRequest("anthropic", "sk-ant-test", "claude-haiku", { messages: [] }, new AbortController().signal);
+    const anthropic = buildProviderRequest("anthropic", "https://api.anthropic.com/v1/messages", "sk-ant-test", "claude-haiku", { messages: [] }, new AbortController().signal);
     expect(anthropic.url).toBe("https://api.anthropic.com/v1/messages");
     expect(anthropic.init.redirect).toBe("manual");
     expect(new Headers(anthropic.init.headers).get("x-api-key")).toBe("sk-ant-test");
@@ -574,6 +898,7 @@ describe("Gateway boundaries", () => {
     expect(JSON.parse(String(anthropic.init.body))).toMatchObject({ model: "claude-haiku", stream: true });
     expect(() => buildProviderRequest(
       "openai",
+      "https://api.openai.com/v1/chat/completions",
       "sk-test",
       "gpt-4o-mini",
       { content: "x".repeat(1_048_576) },

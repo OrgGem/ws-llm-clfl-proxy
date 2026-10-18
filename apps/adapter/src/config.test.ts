@@ -52,6 +52,45 @@ describe("local configuration security", () => {
     })).toThrow("cannot contain credentials, query, or fragment");
   });
 
+  it("requires explicit converter protocol for custom provider IDs while retaining built-in legacy configs", () => {
+    const initial = createInitialConfig({
+      identityUrl: "https://identity.example.test",
+      gatewayUrl: "wss://gateway.example.test/v1/socket",
+      auth: { type: "public", clientId: "client_1", refreshToken: "opaque-refresh-token" },
+    });
+    const envelope = {
+      v: 1,
+      alg: "A256GCM",
+      kid: "test-key",
+      credentialId: "credential_custom",
+      userId: "user_test",
+      projectId: "project_test",
+      provider: "vendor_x",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      nonce: "AAAAAAAAAAAAAAAA",
+      ciphertext: "AAAAAAAAAAAAAAAAAAAAAA",
+    };
+
+    const custom = validateConfig({
+      ...initial,
+      models: [{ id: "vendor-chat", provider: "vendor_x", protocol: "openai", credentialId: "credential_custom" }],
+      envelopes: [envelope],
+    });
+    expect(custom.models[0]).toMatchObject({ provider: "vendor_x", protocol: "openai" });
+    expect(() => validateConfig({
+      ...initial,
+      models: [{ id: "vendor-chat", provider: "vendor_x", credentialId: "credential_custom" }],
+      envelopes: [envelope],
+    })).toThrow("require protocol");
+
+    const legacyBuiltin = validateConfig({
+      ...initial,
+      models: [{ id: "builtin-chat", provider: "openai", credentialId: "credential_openai" }],
+      envelopes: [{ ...envelope, credentialId: "credential_openai", provider: "openai" }],
+    });
+    expect(legacyBuiltin.models[0]?.protocol).toBe("openai");
+  });
+
   it("accepts bracketed IPv6 loopback URLs for local development", () => {
     const config = createInitialConfig({
       identityUrl: "http://[::1]:3000",

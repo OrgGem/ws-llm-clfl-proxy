@@ -20,7 +20,17 @@ describe("secret-free client bootstrap", () => {
       ...bootstrap,
       identityUrl: "https://identity.example.test",
       gatewayUrl: "wss://gateway.example.test/v1/socket",
+      models: [{ id: "chat-fast", provider: "openai", protocol: "openai" }],
     });
+  });
+
+  it("preserves custom provider IDs and their explicit protocol in bootstrap metadata", () => {
+    const custom = { ...bootstrap, models: [{ id: "vendor-chat", provider: "vendor_x", protocol: "openai" }] };
+    expect(parseClientBootstrap(custom).models).toEqual([
+      { id: "vendor-chat", provider: "vendor_x", protocol: "openai" },
+    ]);
+    expect(() => parseClientBootstrap({ ...bootstrap, models: [{ id: "vendor-chat", provider: "vendor_x" }] }))
+      .toThrow("explicit supported protocol");
   });
 
   it("rejects raw secrets and unsupported limit values", () => {

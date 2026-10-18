@@ -45,11 +45,20 @@ export interface AuthorizedModel {
   upstreamModel: string;
 }
 
+export interface AuthorizedProvider {
+  id: string;
+  displayName: string;
+  protocol: "openai" | "anthropic";
+  baseUrl: string;
+  custom: boolean;
+}
+
 export interface IdentityAuthorizationResult {
   allowed: boolean;
   principal?: AuthorizedPrincipal;
   credentialMetadata?: AuthorizedCredentialMetadata;
   authorizedModel?: AuthorizedModel;
+  authorizedProvider?: AuthorizedProvider;
   limits?: unknown;
   reasonCode?: string;
 }
@@ -76,4 +85,8 @@ export interface GatewayDependencies {
   machineIssuer: string;
   envelopeKeys: string;
   fetcher: typeof fetch;
+  /** Test injection for the shared Cloudflare DoH endpoint resolver. */
+  endpointDnsFetcher?: typeof fetch;
+  /** Optional configured public Gateway origin to prevent registry self-targeting. */
+  gatewayOrigin?: string;
 }

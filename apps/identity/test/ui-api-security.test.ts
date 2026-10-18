@@ -112,6 +112,19 @@ describe("Identity browser API client", () => {
     await expect(api.post("/api/credentials", { apiKey: secret })).rejects.toThrow("The request could not be completed. Try again.");
   });
 
+  it("maps custom provider rejection codes to safe actionable UI messages", async () => {
+    const api = createApiClient({
+      origin: "https://identity.example.test",
+      getCsrfToken: () => "csrf",
+      fetchImpl: async () => new Response(JSON.stringify({ error: "endpoint_not_allowed", detail: "private address" }), { status: 400 }),
+    });
+    await expect(api.post("/api/providers", {
+      id: "my_provider", displayName: "My Provider", baseUrl: "https://private.example/v1", protocol: "openai",
+    })).rejects.toThrow("Provider URL must use public HTTPS");
+    await expect(api.put("/api/providers/my_provider", { enabled: true })).rejects.toThrow("Provider URL must use public HTTPS");
+    await expect(api.post("/api/credentials", { apiKey: "secret" })).rejects.toThrow("The request could not be completed. Try again.");
+  });
+
   it("projects setup downloads to the adapter's strict schema and strips secrets", () => {
     const response = {
       version: 1,
@@ -119,7 +132,7 @@ describe("Identity browser API client", () => {
       gatewayUrl: "wss://gateway.example.test/v1/socket",
       projectId: "project-1",
       client: { id: "client-1", clientId: "cli-1", name: "Local", kind: "confidential", clientSecret: "client-secret" },
-      models: [{ provider: "openai", id: "fast-chat", upstreamModel: "internal-model" }],
+      models: [{ provider: "vendor_x", protocol: "openai", id: "fast-chat", upstreamModel: "internal-model" }],
       credentials: [{ id: "cred-1", provider: "openai", keyVersion: "env-v1", apiKey: "provider-secret", envelope: { ciphertext: "sensitive-envelope" } }],
       limits: { maxPayloadBytes: 65536, maxConcurrency: 2, maxSessionSeconds: 60 },
       accessToken: "machine-token",
@@ -133,10 +146,14 @@ describe("Identity browser API client", () => {
       gatewayUrl: "wss://gateway.example.test/v1/socket",
       client: { clientId: "cli-1", kind: "confidential" },
       projectId: "project-1",
-      models: [{ id: "fast-chat", provider: "openai" }],
+      models: [{ id: "fast-chat", provider: "vendor_x", protocol: "openai" }],
       limits: { maxPayloadBytes: 65536, maxConcurrency: 2, maxSessionSeconds: 60 },
     });
     expect(parseClientBootstrap(safe)).toEqual(safe);
+    expect(() => safeBootstrapMetadata({
+      ...response,
+      models: [{ id: "fast-chat", provider: "vendor_x" }],
+    })).toThrow("Custom model grants require a supported protocol");
     const serialized = JSON.stringify(safe);
     for (const secret of ["client-secret", "provider-secret", "sensitive-envelope", "machine-token", "internal-model"]) {
       expect(serialized).not.toContain(secret);

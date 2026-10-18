@@ -2,6 +2,7 @@ import { decryptCredentialEnvelope, CredentialEnvelopeSchema } from "@ws-proxy/s
 import { insertAudit, rateLimit } from "./db.js";
 import { forbidden, json, type WebActor } from "./http.js";
 import { decodeBase64Url, newId, parseEnvelopeKeys, readJson } from "./security.js";
+import { assertProviderBaseUrlPublic, isCanonicalBuiltinProvider, isCustomProviderId, normalizeProviderBaseUrl } from "./provider-registry.js";
 
 export interface ProjectLimits {
   maxPayloadBytes: number;
@@ -136,7 +137,7 @@ export async function handleManagementApi(request: Request, env: Env, actor: Web
     ).bind(bootstrap[1]!).first<{ id: string; clientId: string; projectId: string; kind: string; createdBy: string }>();
     if (!client || !(await role(env, client.projectId, actor.userId))) return forbidden();
     const modelRows = await env.DB.prepare(
-      `SELECT c.provider,c.model AS id FROM client_permissions c
+      `SELECT c.provider,c.model AS id,r.protocol FROM client_permissions c
        JOIN project_permissions p ON p.project_id=? AND p.provider=c.provider AND p.model=c.model
        JOIN providers r ON r.provider=c.provider AND r.enabled=1
        JOIN provider_models m ON m.provider=c.provider AND m.alias=c.model AND m.enabled=1 WHERE c.client_id=? ORDER BY c.provider,c.model`,
@@ -171,8 +172,22 @@ export async function handleManagementApi(request: Request, env: Env, actor: Web
     if (envelope.credentialId !== metadata.id || envelope.userId !== metadata.user_id || envelope.projectId !== metadata.project_id || envelope.provider !== metadata.provider || envelope.kid !== metadata.key_version || envelope.exp !== metadata.expires_at) {
       return json({ error: "credential_invalid" }, 400);
     }
-    const provider = await env.DB.prepare("SELECT enabled FROM providers WHERE provider=?").bind(metadata.provider).first<{ enabled: number }>();
-    if (provider?.enabled !== 1 || !["openai", "anthropic"].includes(metadata.provider)) return forbidden();
+    const provider = await env.DB.prepare(
+      "SELECT enabled,protocol,base_url AS baseUrl,custom FROM providers WHERE provider=?",
+    ).bind(metadata.provider).first<{ enabled: number; protocol: "openai" | "anthropic"; baseUrl: string; custom: number }>();
+    if (!provider || provider.enabled !== 1 || (provider.protocol !== "openai" && provider.protocol !== "anthropic") ||
+        !(isCanonicalBuiltinProvider(metadata.provider, provider.protocol, provider.baseUrl, provider.custom) || isCustomProviderId(metadata.provider, provider.custom))) return forbidden();
+    let endpoint: string;
+    try {
+      if (provider.custom === 1) {
+        const normalized = normalizeProviderBaseUrl(env, provider.baseUrl);
+        if (normalized !== provider.baseUrl) return json({ error: "provider_connection_failed" }, 502);
+        await assertProviderBaseUrlPublic(normalized);
+      }
+      endpoint = new URL("models", provider.baseUrl).href;
+    } catch {
+      return json({ error: "provider_connection_failed" }, 502);
+    }
     let plaintext: Uint8Array | undefined;
     let keyBytes: Uint8Array | undefined;
     try {
@@ -184,9 +199,9 @@ export async function handleManagementApi(request: Request, env: Env, actor: Web
       plaintext = decrypted.plaintext;
       const apiKey = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
       if (!/^[\x21-\x7e]{1,8192}$/.test(apiKey)) return json({ error: "credential_invalid" }, 400);
-      const response = await fetch(metadata.provider === "openai" ? "https://api.openai.com/v1/models" : "https://api.anthropic.com/v1/models", {
+      const response = await fetch(endpoint, {
         method: "GET",
-        headers: metadata.provider === "openai" ? { authorization: `Bearer ${apiKey}` } : { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        headers: provider.protocol === "openai" ? { authorization: `Bearer ${apiKey}` } : { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
         redirect: "error",
         signal: AbortSignal.timeout(10_000),
       });

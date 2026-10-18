@@ -59,7 +59,10 @@ async function handleGatewayRequest(request: Request, env: Env, context: Executi
     identity: env.IDENTITY as IdentityInternalBinding,
     machineIssuer: env.MACHINE_ISSUER,
     envelopeKeys: env.ENVELOPE_KEYS ?? "",
-    fetcher: fetch,
+    fetcher: (input, init) => globalThis.fetch(input, init),
+    ...((env as Env & { GATEWAY_PUBLIC_ORIGIN?: string }).GATEWAY_PUBLIC_ORIGIN
+      ? { gatewayOrigin: (env as Env & { GATEWAY_PUBLIC_ORIGIN?: string }).GATEWAY_PUBLIC_ORIGIN }
+      : {}),
   };
   const authorization = await validateHandshakeToken(accessToken, dependencies);
   if (!authorization) return jsonError(401, "unauthorized");

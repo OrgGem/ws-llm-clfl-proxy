@@ -165,7 +165,7 @@ async function handleCompletion(request: IncomingMessage, response: ServerRespon
   }
   let payload: Record<string, unknown>;
   try {
-    payload = buildProviderPayload(model.provider, rawBody as OpenAiRequest);
+    payload = buildProviderPayload(model.protocol, rawBody as OpenAiRequest);
   } catch (error) {
     sendJson(response, 400, apiError("invalid_request", safeLocalMessage(error)));
     return;
@@ -175,7 +175,7 @@ async function handleCompletion(request: IncomingMessage, response: ServerRespon
   const requestId = crypto.randomUUID();
   const completionId = createCompletionId();
   const created = Math.floor(Date.now() / 1000);
-  const converter = new ProviderStreamConverter(model.provider);
+  const converter = new ProviderStreamConverter(model.protocol);
   const accumulator = new CompletionAccumulator(!isStreaming);
   const parser = new SseParser(MAX_SSE_EVENT_CHARS);
   const abortController = new AbortController();

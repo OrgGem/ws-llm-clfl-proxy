@@ -29,7 +29,7 @@ node apps/adapter/dist/bin.js configure-machine \
   --client-id CLIENT_ID
 ```
 
-For an Identity bootstrap export, use `configure-bootstrap FILE`. The export contains service URLs, a public client ID and kind, project ID, model aliases, and bounded limits, but no client secret or credential envelope. A confidential client uses the exported client ID and reads `WS_PROXY_CLIENT_SECRET`; a public bootstrap starts a fresh pairing and creates a new user-approved client, ignoring the export's public client ID. After setup, add the encrypted envelope and map an allowed alias as below.
+For an Identity bootstrap export, use `configure-bootstrap FILE`. The export contains service URLs, a public client ID and kind, project ID, model aliases with provider IDs and wire protocols, and bounded limits, but no client secret or credential envelope. A confidential client uses the exported client ID and reads `WS_PROXY_CLIENT_SECRET`; a public bootstrap starts a fresh pairing and creates a new user-approved client, ignoring the export's public client ID. After setup, add the encrypted envelope and map an allowed alias as below.
 
 ```sh
 node apps/adapter/dist/bin.js configure-bootstrap client-bootstrap.json
@@ -43,7 +43,13 @@ node apps/adapter/dist/bin.js model add --id my-chat --provider openai --credent
 node apps/adapter/dist/bin.js model list
 ```
 
-`my-chat` is the local alias sent to Gateway; Identity and Gateway must authorize that alias for the selected credential and project. The adapter accepts OpenAI chat-completion JSON and converts tool calls and streamed responses for the configured `openai` or `anthropic` provider. For Anthropic, `tool_choice: "none"` omits tool definitions, and `parallel_tool_calls: false` disables parallel tool use. Unsupported tool-choice shapes and non-boolean parallel settings return a request error rather than being silently dropped. Provider selection, endpoint, upstream model, and keys stay under server-side policy.
+System administrators can register a custom public HTTPS provider in Identity's Providers screen. Its provider ID and endpoint are immutable; register another ID to use a different endpoint. Custom routes use the OpenAI chat-completions protocol, and their API keys use the same encrypted credential form. After registration, add an alias with the provider ID and explicit protocol:
+
+```sh
+node apps/adapter/dist/bin.js model add --id vendor-chat --provider my_provider --protocol openai --credential-id CREDENTIAL_ID
+```
+
+`my-chat` is the local alias sent to Gateway; Identity and Gateway authorize the alias and credential against the project. The adapter keeps the registry provider ID for Gateway authorization and uses the binding's protocol for request and stream conversion. Legacy built-in aliases may omit protocol because `openai` and `anthropic` map to their matching protocol; custom provider IDs require one. For Anthropic, `tool_choice: "none"` omits tool definitions, and `parallel_tool_calls: false` disables parallel tool use. Unsupported tool-choice shapes and non-boolean parallel settings return a request error rather than being silently dropped. Provider selection, endpoint, upstream model, and keys stay under server-side policy.
 
 Start the local server with:
 
