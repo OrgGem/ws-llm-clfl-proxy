@@ -12,6 +12,29 @@ afterEach(async () => {
 });
 
 describe("Gateway WebSocket adapter", () => {
+  it("forwards only the fixed optional request API discriminator", async () => {
+    const starts: Array<Record<string, unknown>> = [];
+    const server = await createMockGateway((socket) => {
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (frame.event !== "request.start" || "op" in frame) return;
+        starts.push(frame);
+        socket.send(responseEnd(String(frame.requestId), -1));
+      });
+    });
+    const gateway = new GatewayClient(server.url, { getAccessToken: async () => "machine-access-token" });
+    active.push({ gateway, server: server.wss });
+
+    await gateway.execute(requestInput(), callbacksWith());
+    for (const api of ["chat.completions", "responses", "completions"] as const) {
+      await gateway.execute(requestInput(api), callbacksWith());
+    }
+
+    expect(starts[0]).not.toHaveProperty("api");
+    expect(starts.slice(1).map((frame) => frame.api)).toEqual(["chat.completions", "responses", "completions"]);
+    expect(starts.every((frame) => !("url" in frame) && !("endpoint" in frame))).toBe(true);
+  });
+
   it("ACKs only after the local writer drains, then accepts the terminal frame", async () => {
     let ackSeen = false;
     const ackWait = deferred<void>();
@@ -221,9 +244,10 @@ function responseEnd(requestId: string, lastSeq: number): string {
   return JSON.stringify({ event: "response.end", requestId, lastSeq });
 }
 
-function requestInput(): GatewayRequestInput {
+function requestInput(api?: GatewayRequestInput["api"]): GatewayRequestInput {
   return {
     requestId: crypto.randomUUID(),
+    ...(api === undefined ? {} : { api }),
     provider: "openai",
     model: "test-model",
     envelope: {

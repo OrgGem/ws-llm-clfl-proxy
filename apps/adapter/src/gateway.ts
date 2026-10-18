@@ -12,6 +12,7 @@ import {
 import type {
   CredentialEnvelope,
   GatewayServerFrame,
+  ProviderRequestApi,
   RequestStartMessage,
   ResponseEndMessage,
   ResponseErrorMessage,
@@ -21,6 +22,7 @@ import { createGatewayProxyAgent } from "./proxy.js";
 
 export interface GatewayRequestInput {
   requestId: string;
+  api?: ProviderRequestApi;
   provider: string;
   model: string;
   envelope: CredentialEnvelope;
@@ -220,6 +222,7 @@ class GatewaySession {
     const frame: RequestStartMessage = {
       event: "request.start",
       requestId: input.requestId,
+      ...(input.api === undefined ? {} : { api: input.api }),
       provider: input.provider,
       model: input.model,
       envelope: input.envelope,

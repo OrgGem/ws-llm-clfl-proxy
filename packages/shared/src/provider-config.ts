@@ -1,6 +1,7 @@
 import ipaddr from "ipaddr.js";
 
 export type ProviderProtocol = "openai" | "anthropic";
+export type ProviderRequestApi = "chat.completions" | "responses" | "completions";
 
 export type ProviderEndpointSecurityErrorCode =
   | "invalid_base_url"
@@ -9,6 +10,7 @@ export type ProviderEndpointSecurityErrorCode =
   | "unsafe_provider_path"
   | "base_url_is_endpoint"
   | "unsupported_provider_protocol"
+  | "unsupported_provider_api"
   | "provider_dns_validation_failed"
   | "provider_dns_non_public_address"
   | "provider_dns_no_public_address";
@@ -36,6 +38,7 @@ const ERROR_MESSAGES: Readonly<Record<ProviderEndpointSecurityErrorCode, string>
   unsafe_provider_path: "Provider BaseURL contains an unsupported or unsafe path.",
   base_url_is_endpoint: "Provider BaseURL must be an API root; the operation path is added automatically.",
   unsupported_provider_protocol: "Provider protocol is not supported.",
+  unsupported_provider_api: "Provider API is not supported for this protocol.",
   provider_dns_validation_failed: "Provider endpoint DNS validation failed.",
   provider_dns_non_public_address: "Provider endpoint resolves to a non-public IP address.",
   provider_dns_no_public_address: "Provider endpoint has no public IPv4 or IPv6 address.",
@@ -181,7 +184,8 @@ function parseHttpsUrl(input: string, rejectOperationPath: boolean): ParsedHttps
   url.hostname = hostname;
   const pathname = safePath(url.pathname);
   const operationPath = pathname.replace(/\/+$/, "").toLowerCase();
-  if (rejectOperationPath && (operationPath.endsWith("/chat/completions") || operationPath.endsWith("/messages"))) {
+  if (rejectOperationPath && ["/chat/completions", "/messages", "/responses", "/completions"]
+    .some((suffix) => operationPath.endsWith(suffix))) {
     error("base_url_is_endpoint");
   }
   return { url, hostname, pathname };
@@ -209,11 +213,21 @@ export function normalizeBaseUrl(input: string, options: NormalizeBaseUrlOptions
   return `${parsed.url.origin}${path}`;
 }
 
-/** Build only the fixed operation URL for a trusted provider protocol. */
-export function buildProviderEndpoint(protocol: ProviderProtocol, baseUrl: string): string {
+/** Build only the fixed operation URL for a trusted provider protocol and API. */
+export function buildProviderEndpoint(
+  protocol: ProviderProtocol,
+  baseUrl: string,
+  api: ProviderRequestApi = "chat.completions",
+): string {
   if (protocol !== "openai" && protocol !== "anthropic") error("unsupported_provider_protocol");
+  if (api !== "chat.completions" && api !== "responses" && api !== "completions") error("unsupported_provider_api");
+  if (protocol === "anthropic" && api !== "chat.completions") error("unsupported_provider_api");
   const normalized = normalizeBaseUrl(baseUrl);
-  const operation = protocol === "openai" ? "chat/completions" : "messages";
+  const operation = protocol === "anthropic"
+    ? "messages"
+    : api === "chat.completions"
+      ? "chat/completions"
+      : api;
   return new URL(operation, normalized).toString();
 }
 

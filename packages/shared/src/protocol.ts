@@ -27,6 +27,7 @@ const ModelNameSchema = z.string().min(1).max(128).regex(/^[^\u0000-\u001f\u007f
 const SequenceSchema = z.number().int().nonnegative().safe();
 const TerminalSequenceSchema = z.number().int().min(-1).safe();
 const UnixSecondsSchema = z.number().int().nonnegative().safe();
+const ProviderRequestApiSchema = z.enum(["chat.completions", "responses", "completions"]);
 const RequestIdSchema = z
   .uuid()
   .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
@@ -101,6 +102,7 @@ const RequestStartSchema = z
   .object({
     event: z.literal("request.start"),
     requestId: RequestIdSchema,
+    api: ProviderRequestApiSchema.optional(),
     provider: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
     model: ModelNameSchema,
     envelope: CredentialEnvelopeSchema,

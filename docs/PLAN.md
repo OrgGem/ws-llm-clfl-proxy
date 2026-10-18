@@ -35,7 +35,7 @@ Token hết hạn phải reauthenticate hoặc đóng theo policy rõ ràng. Gat
 
 ## Local Adapter
 
-Package chạy cùng OpenCode/ứng dụng; trong ChatGPT Cloud chạy trong chính môi trường cloud đó, bind loopback. MVP `/v1/models` và `/v1/chat/completions`, hỗ trợ text, tool calls và usage khi provider có. `/v1/responses` là contract riêng, chỉ bổ sung khi client/connector yêu cầu.
+Package chạy cùng OpenCode/ứng dụng; trong ChatGPT Cloud chạy trong chính môi trường cloud đó, bind loopback. MVP `/v1/models` và `/v1/chat/completions`, hỗ trợ text, tool calls và usage khi provider có. `/v1/responses` là contract riêng; yêu cầu client đã được xác nhận và thiết kế generation stateless được chốt tại ADR 0003. Adapter 0.3.0 bổ sung Responses và legacy `/v1/completions` cho provider OpenAI-protocol; Chat Completions tiếp tục hỗ trợ OpenAI/Anthropic.
 
 Chốt cách bảo vệ local API, lưu envelope/token, SSE error mapping, cancellation, reconnect và retry trước khi triển khai. Mỗi attempt cần danh tính rõ ràng và lỗi ngắt stream phải đến được ứng dụng.
 

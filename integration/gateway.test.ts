@@ -1,4 +1,4 @@
-import { encryptCredentialEnvelope, issueGatewayAccessToken } from "@ws-proxy/shared";
+import { encryptCredentialEnvelope, issueGatewayAccessToken, type ProviderRequestApi } from "@ws-proxy/shared";
 import { env, reset, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { decodeBase64Url, migrateIdentityDatabase, randomId, randomProviderSecret } from "./db-fixtures.js";
@@ -148,6 +148,56 @@ describe("Gateway and Identity Worker integration", () => {
     expect(terminal.event, JSON.stringify({ terminal, provider: await providerStats() })).toBe("response.end");
     expect(chunks.join("")).toContain('[DONE]');
     expect(await providerStats()).toMatchObject({ requests: 1, cancellations: 0 });
+  });
+
+  it("routes native Responses and Completions APIs to fixed OpenAI endpoints and forwards streams", async () => {
+    const { socket, inbox } = await connectGateway(await machineToken(fixtures.owner));
+    expect((await inbox.next()).event).toBe("session.ready");
+
+    for (const testCase of [
+      { api: "responses" as const, path: "/v1/responses", payload: { input: "hello" } },
+      { api: "completions" as const, path: "/v1/completions", payload: { prompt: "hello" } },
+    ]) {
+      const requestId = crypto.randomUUID();
+      const frame = startFrame(requestId, "finite", fixtures.owner.envelope, "openai", testCase.api);
+      frame.payload = testCase.payload;
+      socket.send(JSON.stringify(frame));
+      const chunks: string[] = [];
+      let terminal: ServerFrame | undefined;
+      while (!terminal) {
+        const response = await inbox.next();
+        if (response.event === "response.chunk") {
+          chunks.push(String(response.data));
+          socket.send(JSON.stringify({ event: "request.start", op: "ack", requestId, ackSeq: response.seq }));
+        } else if (response.event === "response.end" || response.event === "response.error") {
+          terminal = response;
+        }
+      }
+      expect(terminal).toMatchObject({ event: "response.end", requestId });
+      expect(chunks.join("")).toContain("[DONE]");
+      expect(await providerStats()).toMatchObject({
+        lastRequest: { method: "POST", origin: "https://api.openai.com", path: testCase.path },
+      });
+    }
+    expect(await providerStats()).toMatchObject({ requests: 2, cancellations: 0 });
+    socket.close(1000, "test complete");
+  });
+
+  it("rejects arbitrary API and endpoint values before provider access", async () => {
+    const cases = [
+      { api: "https://attacker.example/v1/responses" },
+      { payload: { messages: [], endpoint: "https://attacker.example/v1/chat/completions" } },
+    ];
+    for (const overrides of cases) {
+      const { socket, inbox } = await connectGateway(await machineToken(fixtures.owner));
+      expect((await inbox.next()).event).toBe("session.ready");
+      const requestId = crypto.randomUUID();
+      const frame = { ...startFrame(requestId, "finite", fixtures.owner.envelope), ...overrides };
+      const closed = new Promise<number>((resolve) => socket.addEventListener("close", (event) => resolve(event.code), { once: true }));
+      socket.send(JSON.stringify(frame));
+      expect(await closed).toBe(1002);
+      expect(await providerStats()).toMatchObject({ requests: 0, cancellations: 0 });
+    }
   });
 
   it("cancels the provider stream when the client cancels the request", async () => {
@@ -362,10 +412,12 @@ function startFrame(
   model: string,
   envelope: UserFixture["envelope"],
   provider = "openai",
+  api?: ProviderRequestApi,
 ): Record<string, unknown> {
   return {
     event: "request.start",
     requestId,
+    ...(api === undefined ? {} : { api }),
     provider,
     model,
     envelope,
@@ -512,7 +564,8 @@ async function mockProviderFetch(input: RequestInfo | URL, init?: RequestInit): 
   }
   const request = new Request(input, init);
   lastProviderRequest = { method: request.method, origin: url.origin, path: url.pathname };
-  if (request.method !== "POST" || !["https://api.openai.com", "https://custom-provider.example.org"].includes(url.origin) || url.pathname !== "/v1/chat/completions") {
+  if (request.method !== "POST" || !["https://api.openai.com", "https://custom-provider.example.org"].includes(url.origin) ||
+      !["/v1/chat/completions", "/v1/responses", "/v1/completions"].includes(url.pathname)) {
     return Response.json({ error: "unexpected provider route" }, { status: 404 });
   }
 

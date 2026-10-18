@@ -1,6 +1,6 @@
 # Local OpenAI-compatible adapter
 
-The adapter runs on the user's machine and exposes `GET /v1/models` and `POST /v1/chat/completions` on `127.0.0.1`. It obtains a machine access token from Identity over HTTPS and sends that token in the Gateway WSS `Authorization` header. Confidential client credentials use OAuth HTTP Basic authentication over HTTPS. Local auth state is stored in an owner-only config file. The adapter is not a hosted service.
+The adapter runs on the user's machine and exposes `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses` and `POST /v1/completions` on `127.0.0.1`. It obtains a machine access token from Identity over HTTPS and sends that token in the Gateway WSS `Authorization` header. Confidential client credentials use OAuth HTTP Basic authentication over HTTPS. Local auth state is stored in an owner-only config file. The adapter is not a hosted service.
 
 Build the workspace and run the packaged CLI with Node 22.13 or newer:
 
@@ -62,6 +62,32 @@ It binds only to `127.0.0.1`, defaults to port `43128`, and requires the local b
 Configure an OpenAI client with base URL `http://127.0.0.1:43128/v1`, API key from the explicit `token` command, and model `my-chat`. Browser requests must use a loopback Origin; non-loopback Host and Origin values are rejected. A local client disconnect cancels the Gateway request. An interrupted call is never silently replayed and may have been processed or billed upstream.
 
 The executable in `dist/bin.js` is bundled with the shared protocol code. To create a local tarball for distribution alongside the client, run `npm pack --workspace @ws-proxy/adapter`. The package remains private to this repository and is not published by the build.
+
+## Generation API support (adapter 0.3.0)
+
+| Local endpoint | Provider protocol | Streaming and JSON behavior |
+| --- | --- | --- |
+| `/v1/chat/completions` | OpenAI or Anthropic | Text, refusal, function tools, finish reasons and usage. OpenAI also supports up to eight choices, logprobs, legacy function calls and reasoning text extensions. Anthropic supports one choice. |
+| `/v1/responses` | OpenAI | Native Responses input/output items, text, function-call arguments, reasoning and provider usage; named SSE events or the final Response JSON. |
+| `/v1/completions` | OpenAI | Native legacy text completions, prompt/token arrays, choices, logprobs, finish reasons and usage; SSE or buffered JSON. |
+
+A custom provider must implement the requested native upstream endpoint. “OpenAI-compatible” Chat Completions alone does not establish Responses or legacy Completions support. The adapter never falls back to another API or retries a billable call. Anthropic models reject Responses and legacy Completions explicitly. Chat audio input/output is not implemented and is rejected rather than dropped. Legacy `best_of > 1` is rejected before dispatch because Gateway always uses upstream streaming.
+
+Configure your application's OpenAI base URL as `http://127.0.0.1:43128/v1`, use the local bearer token returned by `ws-llm-adapter token`, and use the configured model alias. Example request bodies:
+
+```json
+{"model":"vendor-chat","input":"Hello","stream":true,"store":false}
+```
+
+Send the body above to `/v1/responses`. For tool loops, provide Responses function tools and explicit prior input/output items, including `function_call_output` items with their `call_id`. Responses is stateless: `store:true`, background generation, `previous_response_id`, server conversations and remote `item_reference` input are rejected. Re-submit prior context explicitly. GET/DELETE stored-response endpoints, background cancellation and conversation persistence are not implemented.
+
+```json
+{"model":"vendor-chat","messages":[{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true}}
+```
+
+Send the body above to `/v1/chat/completions`; use `prompt` instead of `messages` for legacy `/v1/completions`.
+
+Chat/legacy streams emit `data: [DONE]` only after both the provider's valid terminal and the Gateway's successful completion. Responses streams use typed events ending in `response.completed` or `response.incomplete`, with no Chat `[DONE]` marker. Incomplete Responses preserve the provider's `incomplete_details`. Errors before streaming starts use an HTTP error response; errors during streaming are explicit safe SSE errors, never successful completion markers. Disconnect cancels upstream, writable backpressure delays WebSocket ACKs, and truncated provider streams fail. Stream/event and buffered-response bounds still apply; buffered output is limited to 8 MiB and a single SSE event to 1 MiB.
 
 ## Real Workers benchmark
 

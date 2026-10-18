@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { encryptCredentialEnvelope, ACK_TIMEOUT_MS } from "@ws-proxy/shared";
+import { encryptCredentialEnvelope, ACK_TIMEOUT_MS, type ProviderRequestApi } from "@ws-proxy/shared";
 import { boundedProjectLimits, GatewaySession, splitUtf8, validateIdentityClaims } from "./session.js";
 import { buildProviderRequest } from "./providers.js";
 import { issuerConfigurationIsValid } from "./index.js";
@@ -211,10 +211,16 @@ async function waitForFrame(
   throw new Error(`Timed out waiting for Gateway frame; saw ${JSON.stringify(socket.frames())}`);
 }
 
-function startFrame(id: number, envelope: unknown, provider = "openai"): Record<string, unknown> {
+function startFrame(
+  id: number,
+  envelope: unknown,
+  provider = "openai",
+  api?: ProviderRequestApi,
+): Record<string, unknown> {
   return {
     event: "request.start",
     requestId: requestId(id),
+    ...(api === undefined ? {} : { api }),
     provider,
     model: "fast-chat",
     envelope,
@@ -275,6 +281,38 @@ describe("GatewaySession", () => {
     test.socket.peerClose();
   });
 
+  it("routes custom Responses only under the authorized base URL and rechecks that route after DNS", async () => {
+    const registry: AuthorizedProvider = {
+      id: "acme-responses",
+      displayName: "Acme Responses",
+      protocol: "openai",
+      baseUrl: "https://responses.example.net/tenant/v2/",
+      custom: true,
+    };
+    const dnsFetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      const isV6 = url.searchParams.get("type") === "AAAA";
+      return Response.json({ Status: 0, Answer: [{ type: isV6 ? 28 : 1, data: isV6 ? "2606:4700:4700::1111" : "1.1.1.1" }] });
+    });
+    const test = createSession({ providerRegistry: registry, endpointDnsFetcher: dnsFetcher as typeof fetch });
+    const frame = startFrame(98, await makeEnvelope("user-a", "project-a", registry.id), registry.id, "responses");
+    frame.payload = { input: "hello" };
+    test.socket.emitMessage(JSON.stringify(frame));
+
+    const terminal = await waitForFrame(test.socket, (item) => item.event === "response.end" && item.requestId === requestId(98));
+    expect(terminal).toMatchObject({ event: "response.end" });
+    expect(test.identity.authorizeTokenRequest).toHaveBeenCalledTimes(2);
+    expect(dnsFetcher).toHaveBeenCalledTimes(2);
+    expect(test.fetcher.mock.calls[0]?.[0]).toBe("https://responses.example.net/tenant/v2/responses");
+    expect(JSON.parse(String((test.fetcher.mock.calls[0]?.[1] as RequestInit).body))).toMatchObject({
+      input: "hello",
+      store: false,
+      model: "gpt-4o-mini",
+      stream: true,
+    });
+    test.socket.peerClose();
+  });
+
   it("routes a registered custom Anthropic-compatible provider to its fixed operation path", async () => {
     const registry: AuthorizedProvider = {
       id: "anthropic-edge",
@@ -310,6 +348,128 @@ describe("GatewaySession", () => {
     expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
     expect(test.fetcher.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/chat/completions");
     test.socket.peerClose();
+  });
+
+  it.each([
+    { api: "responses" as const, endpoint: "https://api.openai.com/v1/responses" },
+    { api: "completions" as const, endpoint: "https://api.openai.com/v1/completions" },
+  ])("routes OpenAI $api to its native fixed endpoint and streams provider bytes", async ({ api, endpoint }) => {
+    const test = createSession();
+    const id = requestId(api === "responses" ? 91 : 92);
+    const frame = startFrame(api === "responses" ? 91 : 92, await makeEnvelope(), "openai", api);
+    frame.payload = api === "responses" ? { input: "Hello" } : { prompt: "Hello" };
+    test.socket.emitMessage(JSON.stringify(frame));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.end" && frame.requestId === id);
+    expect(terminal).toMatchObject({ event: "response.end", requestId: id });
+    expect(test.fetcher).toHaveBeenCalledOnce();
+    expect(test.fetcher.mock.calls[0]?.[0]).toBe(endpoint);
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.socket.frames().some((frame) => frame.event === "response.chunk" && frame.requestId === id && String(frame.data).includes("[DONE]"))).toBe(true);
+    const init = test.fetcher.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toMatchObject({ model: "gpt-4o-mini", stream: true });
+    if (api === "responses") expect(JSON.parse(String(init.body))).toMatchObject({ store: false, input: "Hello" });
+    test.socket.peerClose();
+  });
+
+  it.each([
+    { payload: { input: "Hello", store: true } },
+    { payload: { input: "Hello", background: true } },
+    { payload: { input: "Hello", previous_response_id: "resp_previous" } },
+    { payload: { input: "Hello", conversation: "conv_remote" } },
+    { payload: { input: [{ type: "item_reference", id: "resp_remote_item" }] } },
+  ])("rejects stateful Responses fields before authorization, DNS, or decryption", async ({ payload }) => {
+    const test = createSession();
+    const frame = startFrame(96, await makeEnvelope(), "openai", "responses");
+    frame.payload = payload;
+    test.socket.emitMessage(JSON.stringify(frame));
+
+    const terminal = await waitForFrame(test.socket, (item) => item.event === "response.error" && item.requestId === requestId(96));
+    expect(terminal).toMatchObject({ event: "response.error", code: "invalid_request", upstreamStarted: false });
+    expect(test.identity.authorizeTokenRequest).not.toHaveBeenCalled();
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects a nested Responses item_reference before authorization, decryption, or upstream work", async () => {
+    const envelope = await makeEnvelope();
+    const tamperedEnvelope = { ...envelope };
+    const index = Math.floor(tamperedEnvelope.ciphertext.length / 2);
+    tamperedEnvelope.ciphertext = `${tamperedEnvelope.ciphertext.slice(0, index)}${tamperedEnvelope.ciphertext[index] === "A" ? "B" : "A"}${tamperedEnvelope.ciphertext.slice(index + 1)}`;
+
+    const test = createSession();
+    const frame = startFrame(97, tamperedEnvelope, "openai", "responses");
+    frame.payload = {
+      input: [{
+        role: "assistant",
+        content: [{ type: "item_reference", id: "resp_remote_item" }],
+      }],
+    };
+    test.socket.emitMessage(JSON.stringify(frame));
+
+    const terminal = await waitForFrame(test.socket, (item) => item.event === "response.error" && item.requestId === requestId(97));
+    expect(terminal).toMatchObject({ event: "response.error", code: "invalid_request", upstreamStarted: false });
+    expect(test.identity.authorizeTokenRequest).not.toHaveBeenCalled();
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("counts the forced Responses store:false field against the project payload limit", async () => {
+    const requestLimit = 1_024;
+    const baseBodyBytes = encoder.encode(JSON.stringify({ input: "", model: "gpt-4o-mini", stream: true })).byteLength;
+    const inputBytes = requestLimit - baseBodyBytes;
+    const test = createSession({ requestLimits: { maxPayloadBytes: requestLimit, maxConcurrency: 1, maxSessionSeconds: 60 } });
+    const frame = startFrame(99, await makeEnvelope(), "openai", "responses");
+    frame.payload = { input: "x".repeat(inputBytes) };
+    test.socket.emitMessage(JSON.stringify(frame));
+
+    const terminal = await waitForFrame(test.socket, (item) => item.event === "response.error" && item.requestId === requestId(99));
+    expect(terminal).toMatchObject({ event: "response.error", code: "invalid_request", upstreamStarted: false });
+    expect(test.identity.authorizeTokenRequest).toHaveBeenCalledOnce();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects OpenAI generation APIs for Anthropic before decrypting or resolving endpoints", async () => {
+    const registry: AuthorizedProvider = {
+      id: "anthropic",
+      displayName: "Anthropic",
+      protocol: "anthropic",
+      baseUrl: "https://api.anthropic.com/v1/",
+      custom: false,
+    };
+    const envelope = await makeEnvelope("user-a", "project-a", "anthropic");
+    const tampered = { ...envelope, ciphertext: `${envelope.ciphertext.slice(0, -1)}${envelope.ciphertext.endsWith("A") ? "B" : "A"}` };
+    const test = createSession({ providerRegistry: registry, credentialProvider: "anthropic" });
+    const id = requestId(93);
+    test.socket.emitMessage(JSON.stringify(startFrame(93, tampered, "anthropic", "responses")));
+
+    const terminal = await waitForFrame(test.socket, (frame) => frame.event === "response.error" && frame.requestId === id);
+    expect(terminal).toMatchObject({ event: "response.error", code: "invalid_request", upstreamStarted: false });
+    expect(test.identity.authorizeTokenRequest).toHaveBeenCalledOnce();
+    expect(test.endpointDnsFetcher).not.toHaveBeenCalled();
+    expect(test.fetcher).not.toHaveBeenCalled();
+    test.socket.peerClose();
+  });
+
+  it("rejects invalid API discriminators and arbitrary endpoint fields before authorization", async () => {
+    const invalidApi = createSession();
+    const invalidApiFrame = startFrame(94, await makeEnvelope());
+    invalidApiFrame.api = "https://attacker.example/v1/responses";
+    invalidApi.socket.emitMessage(JSON.stringify(invalidApiFrame));
+    expect(invalidApi.socket.closeCode).toBe(1002);
+    expect(invalidApi.identity.authorizeTokenRequest).not.toHaveBeenCalled();
+    expect(invalidApi.fetcher).not.toHaveBeenCalled();
+
+    const arbitraryEndpoint = createSession();
+    const arbitraryEndpointFrame = startFrame(95, await makeEnvelope());
+    arbitraryEndpointFrame.payload = { messages: [], endpoint: "https://attacker.example/v1/chat/completions" };
+    arbitraryEndpoint.socket.emitMessage(JSON.stringify(arbitraryEndpointFrame));
+    expect(arbitraryEndpoint.socket.closeCode).toBe(1002);
+    expect(arbitraryEndpoint.identity.authorizeTokenRequest).not.toHaveBeenCalled();
+    expect(arbitraryEndpoint.fetcher).not.toHaveBeenCalled();
   });
 
   it("rejects a custom provider whose route changes during the post-DNS Identity check", async () => {
@@ -896,6 +1056,64 @@ describe("Gateway boundaries", () => {
     expect(new Headers(anthropic.init.headers).get("x-api-key")).toBe("sk-ant-test");
     expect(new Headers(anthropic.init.headers).get("authorization")).toBeNull();
     expect(JSON.parse(String(anthropic.init.body))).toMatchObject({ model: "claude-haiku", stream: true });
+    const responses = buildProviderRequest(
+      "openai",
+      "https://api.openai.com/v1/responses",
+      "sk-test",
+      "gpt-4o-mini",
+      { input: "hello" },
+      new AbortController().signal,
+      "responses",
+    );
+    expect(responses.url).toBe("https://api.openai.com/v1/responses");
+    expect(JSON.parse(String(responses.init.body))).toMatchObject({ input: "hello", store: false, model: "gpt-4o-mini", stream: true });
+    const completions = buildProviderRequest(
+      "openai",
+      "https://api.openai.com/v1/completions",
+      "sk-test",
+      "gpt-4o-mini",
+      { prompt: "hello" },
+      new AbortController().signal,
+      "completions",
+    );
+    expect(completions.url).toBe("https://api.openai.com/v1/completions");
+    expect(JSON.parse(String(completions.init.body))).toMatchObject({ prompt: "hello", model: "gpt-4o-mini", stream: true });
+    expect(() => buildProviderRequest(
+      "openai",
+      "https://api.openai.com/v1/chat/completions",
+      "sk-test",
+      "gpt-4o-mini",
+      { input: "hello" },
+      new AbortController().signal,
+      "responses",
+    )).toThrow(/endpoint is invalid/);
+    expect(() => buildProviderRequest(
+      "anthropic",
+      "https://api.anthropic.com/v1/messages",
+      "sk-ant-test",
+      "claude-haiku",
+      { input: "hello" },
+      new AbortController().signal,
+      "responses",
+    )).toThrow(/not supported by this provider/);
+    expect(() => buildProviderRequest(
+      "openai",
+      "https://api.openai.com/v1/responses",
+      "sk-test",
+      "gpt-4o-mini",
+      { input: "hello", previous_response_id: "resp_previous" },
+      new AbortController().signal,
+      "responses",
+    )).toThrow(/stateless/);
+    expect(() => buildProviderRequest(
+      "openai",
+      "https://api.openai.com/v1/responses",
+      "sk-test",
+      "gpt-4o-mini",
+      { input: [{ type: "item_reference", id: "resp_remote_item" }] },
+      new AbortController().signal,
+      "responses",
+    )).toThrow(/stateless/);
     expect(() => buildProviderRequest(
       "openai",
       "https://api.openai.com/v1/chat/completions",

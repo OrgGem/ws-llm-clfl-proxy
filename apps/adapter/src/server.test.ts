@@ -101,6 +101,73 @@ describe("loopback OpenAI-compatible HTTP boundary", () => {
     expect(body.endsWith("data: [DONE]\n\n")).toBe(true);
   });
 
+  it("streams interleaved choices, tool arguments, logprobs and detailed usage without merging choices", async () => {
+    const upstream = [
+      { choices: [{ index: 1, delta: { content: "Second" }, logprobs: { content: [{ token: "Second", logprob: -0.2, bytes: [83], top_logprobs: [] }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: '{"q":' } }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"test"}' } }] }, finish_reason: "tool_calls" }, { index: 1, delta: {}, finish_reason: "stop" }] },
+      { choices: [], usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13, completion_tokens_details: { reasoning_tokens: 2 } } },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
+    const { server, token } = await createServer({
+      execute: async (input, callbacks) => {
+        expect(input.payload.n).toBe(2);
+        // Split JSON and tool argument fragments across unrelated transport boundaries.
+        for (let offset = 0, seq = 0; offset < upstream.length; offset += 11, seq++) {
+          await callbacks.onChunk(seq, upstream.slice(offset, offset + 11));
+        }
+        await callbacks.onEnd({ event: "response.end", requestId: input.requestId, lastSeq: 0, usage: { inputTokens: 9, outputTokens: 4, totalTokens: 13 } });
+      }, close: () => undefined,
+    });
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "local-chat", messages: [{ role: "user", content: "test" }], n: 2, stream: true, stream_options: { include_usage: true } }),
+    });
+    const body = await response.text();
+    const events = body.split("\n\n").filter((line) => line.startsWith("data: ") && !line.includes("[DONE]")).map((line) => JSON.parse(line.slice(6)));
+    expect(events.flatMap((event) => event.choices).filter((choice) => choice.delta.role).map((choice) => choice.index).sort()).toEqual([0, 1]);
+    expect(events.flatMap((event) => event.choices).filter((choice) => choice.finish_reason).map((choice) => [choice.index, choice.finish_reason])).toEqual([[0, "tool_calls"], [1, "stop"]]);
+    expect(events.flatMap((event) => event.choices).find((choice) => choice.logprobs)?.logprobs.content[0].token).toBe("Second");
+    expect(events.at(-1).usage.completion_tokens_details.reasoning_tokens).toBe(2);
+    expect(body.endsWith("data: [DONE]\n\n")).toBe(true);
+  });
+
+  it("returns separate buffered choices with refusal and logprobs", async () => {
+    const { server, token } = await createServer({
+      execute: async (input, callbacks) => {
+        await callbacks.onChunk(0, 'data: {"choices":[{"index":0,"delta":{"refusal":"Cannot do that"},"logprobs":{"refusal":[{"token":"Cannot","logprob":-0.1}]},"finish_reason":"stop"},{"index":1,"delta":{"content":"Safe alternative"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+        await callbacks.onEnd({ event: "response.end", requestId: input.requestId, lastSeq: 0 });
+      }, close: () => undefined,
+    });
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "local-chat", messages: [{ role: "user", content: "test" }], n: 2 }),
+    });
+    const body = await response.json() as { choices: Array<{ index: number; message: { content: string; refusal?: string }; logprobs?: { refusal: unknown[] } }> };
+    expect(body.choices.map((choice) => choice.index)).toEqual([0, 1]);
+    expect(body.choices[0]?.message.refusal).toBe("Cannot do that");
+    expect(body.choices[0]?.logprobs?.refusal).toHaveLength(1);
+    expect(body.choices[1]?.message.content).toBe("Safe alternative");
+  });
+
+  it("never reports a successful terminal when provider DONE lacks a choice finish reason", async () => {
+    const { server, token } = await createServer({
+      execute: async (input, callbacks) => {
+        try {
+          await callbacks.onChunk(0, 'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\ndata: [DONE]\n\n');
+          await callbacks.onEnd({ event: "response.end", requestId: input.requestId, lastSeq: 0 });
+        } catch (error) { await callbacks.onLocalFailure(error as Error); }
+      }, close: () => undefined,
+    });
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "local-chat", messages: [{ role: "user", content: "test" }], stream: true }),
+    });
+    const body = await response.text();
+    expect(body).toContain("partial");
+    expect(body).toContain('"code":"stream_error"');
+    expect(body).not.toContain("[DONE]");
+  });
+
   it("returns a sanitized Gateway failure without leaking its rejection message", async () => {
     const gateway: GatewayExecutor = {
       execute: async () => { throw new Error("secret key and private prompt"); },

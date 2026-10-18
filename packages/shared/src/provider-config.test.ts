@@ -41,10 +41,18 @@ describe("custom provider endpoint configuration", () => {
   it("appends only the fixed protocol operation path", () => {
     expect(buildProviderEndpoint("openai", "https://api.vendor.example.com/v1"))
       .toBe("https://api.vendor.example.com/v1/chat/completions");
+    expect(buildProviderEndpoint("openai", "https://api.vendor.example.com/v1", "responses"))
+      .toBe("https://api.vendor.example.com/v1/responses");
+    expect(buildProviderEndpoint("openai", "https://api.vendor.example.com/v1", "completions"))
+      .toBe("https://api.vendor.example.com/v1/completions");
     expect(buildProviderEndpoint("anthropic", "https://api.vendor.example.com/anthropic/v1/"))
       .toBe("https://api.vendor.example.com/anthropic/v1/messages");
     expect(buildProviderEndpoint("openai", "https://api.vendor.example.com"))
       .toBe("https://api.vendor.example.com/chat/completions");
+    expect(() => buildProviderEndpoint("anthropic", "https://api.vendor.example.com/v1", "responses"))
+      .toThrowError(expect.objectContaining({ code: "unsupported_provider_api" }));
+    expect(() => buildProviderEndpoint("anthropic", "https://api.vendor.example.com/v1", "completions"))
+      .toThrowError(expect.objectContaining({ code: "unsupported_provider_api" }));
   });
 
   it("rejects credentials, queries, fragments, insecure schemes, and non-default ports", () => {
@@ -89,6 +97,8 @@ describe("custom provider endpoint configuration", () => {
     for (const input of [
       "https://api.vendor.example.com/v1/chat/completions",
       "https://api.vendor.example.com/v1/messages/",
+      "https://api.vendor.example.com/v1/responses",
+      "https://api.vendor.example.com/v1/completions/",
     ]) {
       expect(() => normalizeBaseUrl(input)).toThrowError(expect.objectContaining({ code: "base_url_is_endpoint" }));
     }

@@ -1,3 +1,5 @@
+import { MAX_JSON_DEPTH, MAX_JSON_NODES, type ProviderRequestApi } from "@ws-proxy/shared";
+
 export type ProviderProtocol = "openai" | "anthropic";
 export type ProviderId = ProviderProtocol;
 
@@ -52,6 +54,56 @@ export function validateUpstreamModel(model: string): boolean {
   return SAFE_MODEL_ID.test(model);
 }
 
+function inputContainsRemoteItemReference(value: unknown): boolean {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  const visited = new Set<object>();
+  let count = 0;
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) continue;
+    count += 1;
+    // Protocol validation imposes these bounds on JSON payloads. Treat a direct
+    // call outside those bounds as invalid too, rather than scanning forever.
+    if (count > MAX_JSON_NODES || current.depth > MAX_JSON_DEPTH) return true;
+
+    const item = current.value;
+    if (item === null || typeof item !== "object") continue;
+    if (visited.has(item)) return true;
+    visited.add(item);
+
+    if (!Array.isArray(item) && (item as Record<string, unknown>).type === "item_reference") return true;
+    for (const child of Array.isArray(item) ? item : Object.values(item)) {
+      pending.push({ value: child, depth: current.depth + 1 });
+    }
+  }
+
+  return false;
+}
+
+/** Force Responses into stateless mode and reject server-managed remote handles. */
+export function providerPayloadForApi(
+  api: ProviderRequestApi,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (api !== "chat.completions" && api !== "responses" && api !== "completions") {
+    throw new ProviderCallError("invalid_request", "The requested provider API is invalid.", false);
+  }
+  if (api !== "responses") return payload;
+
+  const invalidBoolean = (name: "store" | "background") => payload[name] !== undefined && typeof payload[name] !== "boolean";
+  if (payload.store === true || payload.background === true || invalidBoolean("store") || invalidBoolean("background") ||
+      (payload.previous_response_id !== undefined && payload.previous_response_id !== null) ||
+      (payload.conversation !== undefined && payload.conversation !== null) || inputContainsRemoteItemReference(payload.input)) {
+    throw new ProviderCallError(
+      "invalid_request",
+      "Responses requests must be stateless and cannot use background generation.",
+      false,
+    );
+  }
+  return { ...payload, store: false };
+}
+
 export function providerKeyFromBytes(protocol: ProviderProtocol, plaintext: Uint8Array): string {
   if (plaintext.byteLength === 0 || plaintext.byteLength > MAX_PROVIDER_KEY_BYTES) {
     throw new TypeError("Provider credential has an invalid size");
@@ -84,6 +136,7 @@ export function buildProviderRequest(
   upstreamModel: string,
   payload: Record<string, unknown>,
   signal: AbortSignal,
+  api: ProviderRequestApi = "chat.completions",
 ): ProviderRequest {
   if (!validateUpstreamModel(upstreamModel)) {
     throw new TypeError("Authorized upstream model is invalid");
@@ -95,8 +148,18 @@ export function buildProviderRequest(
   } catch {
     throw new TypeError("Authorized provider endpoint is invalid");
   }
-  const expectedSuffix = protocol === "openai" ? "/chat/completions" : "/messages";
-  if (!isProviderProtocol(protocol) || url.protocol !== "https:" || url.username || url.password ||
+  if (api !== "chat.completions" && api !== "responses" && api !== "completions") {
+    throw new TypeError("Requested provider API is invalid");
+  }
+  if (!isProviderProtocol(protocol) || (protocol === "anthropic" && api !== "chat.completions")) {
+    throw new TypeError("Requested API is not supported by this provider");
+  }
+  const expectedSuffix = protocol === "anthropic"
+    ? "/messages"
+    : api === "chat.completions"
+      ? "/chat/completions"
+      : `/${api}`;
+  if (url.protocol !== "https:" || url.username || url.password ||
       url.search || url.hash || !url.pathname.endsWith(expectedSuffix)) {
     throw new TypeError("Authorized provider endpoint is invalid");
   }
@@ -112,7 +175,8 @@ export function buildProviderRequest(
     headers.set("anthropic-version", "2023-06-01");
   }
 
-  const body = JSON.stringify({ ...payload, model: upstreamModel, stream: true });
+  const apiPayload = providerPayloadForApi(api, payload);
+  const body = JSON.stringify({ ...apiPayload, model: upstreamModel, stream: true });
   if (encoder.encode(body).byteLength > 1_048_576) {
     throw new ProviderCallError("invalid_request", "The provider request exceeds the Gateway payload limit.", false);
   }

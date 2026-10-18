@@ -15,6 +15,7 @@ import {
   buildProviderEndpoint,
   normalizeBaseUrl,
   parseGatewayFrame,
+  type ProviderRequestApi,
   type RequestStartMessage,
   type GatewayServerFrame,
 } from "@ws-proxy/shared";
@@ -25,6 +26,7 @@ import {
   isProviderId,
   isProviderProtocol,
   ProviderCallError,
+  providerPayloadForApi,
   providerKeyFromBytes,
   validateUpstreamModel,
   type ProviderProtocol,
@@ -118,19 +120,28 @@ function providerDisallowed(): RequestFailure {
   });
 }
 
+function providerApiUnsupported(): RequestFailure {
+  return new RequestFailure({
+    code: "invalid_request",
+    message: "The selected API is not supported by this provider.",
+  });
+}
+
 function resolveProviderRoute(
   value: unknown,
   requestedProvider: string,
   forbiddenOrigins: readonly string[],
+  api: ProviderRequestApi,
 ): ProviderRoute {
   if (value === undefined) {
     if (!isProviderId(requestedProvider)) throw providerDisallowed();
     const builtin = BUILTIN_PROVIDERS[requestedProvider];
+    if (builtin.protocol === "anthropic" && api !== "chat.completions") throw providerApiUnsupported();
     return {
       id: requestedProvider,
       protocol: builtin.protocol,
       baseUrl: builtin.baseUrl,
-      endpoint: builtin.endpoint,
+      endpoint: buildProviderEndpoint(builtin.protocol, builtin.baseUrl, api),
       custom: false,
     };
   }
@@ -140,6 +151,7 @@ function resolveProviderRoute(
       value.id !== requestedProvider) {
     throw providerDisallowed();
   }
+  if (value.protocol === "anthropic" && api !== "chat.completions") throw providerApiUnsupported();
 
   let baseUrl: string;
   try {
@@ -154,7 +166,7 @@ function resolveProviderRoute(
     if (isProviderId(value.id)) throw providerDisallowed();
     let endpoint: string;
     try {
-      endpoint = buildProviderEndpoint(value.protocol, baseUrl);
+      endpoint = buildProviderEndpoint(value.protocol, baseUrl, api);
     } catch {
       throw providerDisallowed();
     }
@@ -164,11 +176,12 @@ function resolveProviderRoute(
   if (!isProviderId(value.id) || value.protocol !== value.id) throw providerDisallowed();
   const builtin = BUILTIN_PROVIDERS[value.id];
   if (baseUrl !== builtin.baseUrl) throw providerDisallowed();
+  if (builtin.protocol === "anthropic" && api !== "chat.completions") throw providerApiUnsupported();
   return {
     id: value.id,
     protocol: builtin.protocol,
     baseUrl: builtin.baseUrl,
-    endpoint: builtin.endpoint,
+    endpoint: buildProviderEndpoint(builtin.protocol, builtin.baseUrl, api),
     custom: false,
   };
 }
@@ -484,7 +497,18 @@ export class GatewaySession {
       return;
     }
 
-    const task = this.createTask(message);
+    let providerPayload: Record<string, unknown>;
+    try {
+      providerPayload = providerPayloadForApi(message.api ?? "chat.completions", message.payload);
+    } catch (error) {
+      const failure = error instanceof ProviderCallError
+        ? new RequestFailure({ code: error.code, message: error.message, retryable: error.retryable })
+        : new RequestFailure({ code: "invalid_request", message: "The request payload is invalid." });
+      this.sendRequestError(message.requestId, failure, -1, false);
+      return;
+    }
+
+    const task = this.createTask({ ...message, payload: providerPayload });
     this.active.set(message.requestId, task);
     this.clearIdleTimer();
     if (this.requestIds.size === MAX_REQUEST_IDS_PER_SOCKET) this.sendDraining("policy", true);
@@ -536,6 +560,8 @@ export class GatewaySession {
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let reservedReadBytes = 0;
     try {
+      const api = task.message.api ?? "chat.completions";
+      const providerPayload = task.message.payload;
       const forbiddenOrigins = [new URL(this.dependencies.machineIssuer).origin];
       if (this.dependencies.gatewayOrigin) {
         forbiddenOrigins.push(new URL(this.dependencies.gatewayOrigin).origin);
@@ -575,14 +601,19 @@ export class GatewaySession {
           throw new RequestFailure({ code: "model_disallowed", message: "This model is not enabled for the project." });
         }
         const providerPayloadBytes = encoder.encode(JSON.stringify({
-          ...task.message.payload,
+          ...providerPayload,
           model: authorizedModel.upstreamModel,
           stream: true,
         })).byteLength;
         if (providerPayloadBytes > requestLimits.maxPayloadBytes) {
           throw new RequestFailure({ code: "invalid_request", message: "The request payload exceeds the project limit." });
         }
-        const route = resolveProviderRoute(authorization.authorizedProvider, task.message.provider, forbiddenOrigins);
+        const route = resolveProviderRoute(
+          authorization.authorizedProvider,
+          task.message.provider,
+          forbiddenOrigins,
+          api,
+        );
         if (metadata.provider !== route.id) throw providerDisallowed();
         return { metadata, authorizedModel, requestLimits, route };
       };
@@ -680,8 +711,9 @@ export class GatewaySession {
         route.endpoint,
         apiKey,
         authorizedModel.upstreamModel,
-        task.message.payload,
+        providerPayload,
         task.controller.signal,
+        api,
       );
 
       task.upstreamStarted = true;

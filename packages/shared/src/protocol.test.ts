@@ -62,6 +62,7 @@ describe("Gateway protocol v1", () => {
 
     expect(ready.event).toBe("session.ready");
     expect(start.event).toBe("request.start");
+    expect(start).not.toHaveProperty("api");
     expect(ack).toMatchObject({ event: "request.start", op: "ack", ackSeq: 0 });
     expect(chunk.event).toBe("response.chunk");
     expect(end.event).toBe("response.end");
@@ -105,6 +106,22 @@ describe("Gateway protocol v1", () => {
     expect(() => parseGatewayMessage(requestStart({ messages: [], endpoint: "https://attacker.test" }))).toThrow(
       GatewayProtocolError,
     );
+  });
+
+  it("accepts only the fixed request API discriminator on normal starts", () => {
+    for (const api of ["chat.completions", "responses", "completions"] as const) {
+      expect(parseGatewayMessage({ ...requestStart(), api })).toMatchObject({ event: "request.start", api });
+    }
+    for (const api of ["/responses", "https://attacker.example/v1/responses", "messages", ""] as const) {
+      expect(() => parseGatewayMessage({ ...requestStart(), api })).toThrow(GatewayProtocolError);
+    }
+    expect(() => parseGatewayMessage({
+      event: "request.start",
+      op: "ack",
+      requestId,
+      ackSeq: 0,
+      api: "responses",
+    })).toThrow(GatewayProtocolError);
   });
 
   it("enforces UTF-8 chunk byte limits and rejects empty chunks", () => {

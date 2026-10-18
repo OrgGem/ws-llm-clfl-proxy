@@ -6,6 +6,8 @@ import { TokenProvider } from "./auth.js";
 import { GatewayClient, GatewayOverloadedError, GatewayPayloadTooLargeError, type GatewayCallbacks, type GatewayRequestInput } from "./gateway.js";
 import { CompletionAccumulator, createCompletionId, buildProviderPayload, ProviderStreamConverter, type OpenAiRequest, type ProviderDelta, type Provider, type OpenAiUsage } from "./provider.js";
 import { SseParser } from "./sse.js";
+import { handleResponses } from "./responses.js";
+import { handleLegacyCompletion } from "./legacy-completions.js";
 import type { AdapterConfig } from "./types.js";
 import type { ResponseEndMessage, ResponseErrorMessage } from "@ws-proxy/shared";
 
@@ -125,6 +127,14 @@ async function handleRequest(
     await handleCompletion(request, response, config, gateway);
     return;
   }
+  if (request.method === "POST" && url.pathname === "/v1/responses") {
+    await handleResponses(request, response, config, gateway);
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/v1/completions") {
+    await handleLegacyCompletion(request, response, config, gateway);
+    return;
+  }
   sendJson(response, 404, apiError("not_found", "Endpoint not found"));
 }
 
@@ -175,7 +185,7 @@ async function handleCompletion(request: IncomingMessage, response: ServerRespon
   const requestId = crypto.randomUUID();
   const completionId = createCompletionId();
   const created = Math.floor(Date.now() / 1000);
-  const converter = new ProviderStreamConverter(model.protocol);
+  const converter = new ProviderStreamConverter(model.protocol, typeof rawBody.n === "number" ? rawBody.n : 1);
   const accumulator = new CompletionAccumulator(!isStreaming);
   const parser = new SseParser(MAX_SSE_EVENT_CHARS);
   const abortController = new AbortController();
@@ -186,14 +196,14 @@ async function handleCompletion(request: IncomingMessage, response: ServerRespon
     isStreaming,
     includeUsage,
   });
-  let pendingFinishReason: string | undefined;
+  const pendingFinishReasons = new Map<number, string>();
   let nonStreamingBytes = 0;
 
   const handleUpdates = async (updates: ProviderDelta[]) => {
     for (const update of updates) {
       accumulator.add(update);
       if (isStreaming) {
-        if (update.finishReason) pendingFinishReason = update.finishReason;
+        if (update.finishReason) pendingFinishReasons.set(update.index, update.finishReason);
         const { finishReason: _finishReason, ...withoutFinishReason } = update;
         await writer.emit(withoutFinishReason);
       }
@@ -221,11 +231,11 @@ async function handleCompletion(request: IncomingMessage, response: ServerRespon
         await handleUpdates(converter.consume(event));
       }
       if (!converter.completed) throw new Error("Provider stream ended without its success sentinel");
-      const usage = gatewayUsage(frame) ?? converter.usage;
+      const usage = converter.usage ?? gatewayUsage(frame);
       if (isStreaming) {
-        await writer.finish(pendingFinishReason ?? accumulator.snapshot().finishReason, usage);
+        await writer.finish(pendingFinishReasons, usage, converter.systemFingerprint);
       } else {
-        sendJson(response, 200, completionJson(completionId, created, model.id, accumulator, usage));
+        sendJson(response, 200, completionJson(completionId, created, model.id, accumulator, usage, converter.systemFingerprint));
       }
     },
     onError: async (frame) => {
@@ -263,6 +273,8 @@ async function handleCompletion(request: IncomingMessage, response: ServerRespon
 class CompletionWriter {
   private started = false;
   private ended = false;
+  private readonly startedChoices = new Set<number>();
+  private systemFingerprint: string | undefined;
 
   constructor(
     private readonly response: ServerResponse,
@@ -271,15 +283,19 @@ class CompletionWriter {
 
   async emit(update: ProviderDelta): Promise<void> {
     if (!this.meta.isStreaming || this.ended) return;
-    if (!update.delta.content && !update.delta.refusal && (!update.delta.tool_calls || update.delta.tool_calls.length === 0)) return;
-    await this.ensureStarted();
-    await this.write(`data: ${JSON.stringify(this.chunk(update.delta, null))}\n\n`);
+    if (update.systemFingerprint) this.systemFingerprint = update.systemFingerprint;
+    if (Object.keys(update.delta).length === 0 && update.logprobs === undefined) return;
+    await this.ensureChoiceStarted(update.index);
+    await this.write(`data: ${JSON.stringify(this.chunk(update.delta, null, update.index, update.logprobs))}\n\n`);
   }
 
-  async finish(finishReason: string, usage?: OpenAiUsage): Promise<void> {
+  async finish(finishReasons: Map<number, string>, usage?: OpenAiUsage, systemFingerprint?: string): Promise<void> {
     if (!this.meta.isStreaming || this.ended) return;
-    await this.ensureStarted();
-    await this.write(`data: ${JSON.stringify(this.chunk({}, finishReason))}\n\n`);
+    if (systemFingerprint) this.systemFingerprint = systemFingerprint;
+    for (const [index, finishReason] of [...finishReasons].sort(([a], [b]) => a - b)) {
+      await this.ensureChoiceStarted(index);
+      await this.write(`data: ${JSON.stringify(this.chunk({}, finishReason, index))}\n\n`);
+    }
     if (this.meta.includeUsage && usage) {
       await this.write(`data: ${JSON.stringify({
         id: this.meta.requestId,
@@ -314,6 +330,13 @@ class CompletionWriter {
     this.response.end();
   }
 
+  private async ensureChoiceStarted(index: number): Promise<void> {
+    await this.ensureStarted();
+    if (this.startedChoices.has(index)) return;
+    this.startedChoices.add(index);
+    await this.write(`data: ${JSON.stringify(this.chunk({ role: "assistant" }, null, index))}\n\n`);
+  }
+
   private async ensureStarted(): Promise<void> {
     if (this.started || this.ended) return;
     this.started = true;
@@ -322,16 +345,17 @@ class CompletionWriter {
     this.response.setHeader("cache-control", "no-cache, no-transform");
     this.response.setHeader("connection", "keep-alive");
     this.response.setHeader("x-accel-buffering", "no");
-    await this.write(`data: ${JSON.stringify(this.chunk({ role: "assistant" }, null))}\n\n`);
+
   }
 
-  private chunk(delta: Record<string, unknown>, finishReason: string | null): Record<string, unknown> {
+  private chunk(delta: Record<string, unknown>, finishReason: string | null, index: number, logprobs?: unknown): Record<string, unknown> {
     return {
       id: this.meta.requestId,
       object: "chat.completion.chunk",
+      ...(this.systemFingerprint ? { system_fingerprint: this.systemFingerprint } : {}),
       created: this.meta.created,
       model: this.meta.model,
-      choices: [{ index: 0, delta, finish_reason: finishReason }],
+      choices: [{ index, delta, finish_reason: finishReason, ...(logprobs === undefined ? {} : { logprobs }) }],
     };
   }
 
@@ -448,17 +472,23 @@ function apiError(code: string, message: string, extra: Record<string, unknown> 
   return { error: { message, type: code, code, ...extra } };
 }
 
-function completionJson(id: string, created: number, model: string, accumulator: CompletionAccumulator, usage?: OpenAiUsage): Record<string, unknown> {
-  const result = accumulator.snapshot();
-  const message: Record<string, unknown> = { role: "assistant", content: result.content || null };
-  if (result.refusal) message.refusal = result.refusal;
-  if (result.toolCalls.length > 0) message.tool_calls = result.toolCalls;
+function completionJson(id: string, created: number, model: string, accumulator: CompletionAccumulator, usage?: OpenAiUsage, systemFingerprint?: string): Record<string, unknown> {
+  const choices = accumulator.choiceIndices.map((index) => {
+    const result = accumulator.snapshot(index);
+    const message: Record<string, unknown> = { role: "assistant", content: result.content || null };
+    if (result.refusal) message.refusal = result.refusal;
+    if (result.toolCalls.length > 0) message.tool_calls = result.toolCalls;
+    if (result.reasoningContent) message.reasoning_content = result.reasoningContent;
+    if (result.functionCall) message.function_call = result.functionCall;
+    return { index, message, finish_reason: result.finishReason, ...(result.logprobs === undefined ? {} : { logprobs: result.logprobs }) };
+  });
   return {
     id,
     object: "chat.completion",
+    ...(systemFingerprint ? { system_fingerprint: systemFingerprint } : {}),
     created,
     model,
-    choices: [{ index: 0, message, finish_reason: result.finishReason }],
+    choices,
     ...(usage ? { usage } : {}),
   };
 }
@@ -501,7 +531,12 @@ function safeLocalMessage(error: unknown): string {
     "Assistant tool call arguments must be valid JSON for Anthropic",
     "Invalid assistant tool call",
     "Anthropic tools must use the OpenAI function tool shape",
-    "This adapter supports exactly one completion choice per request",
+    "n must be an integer from 1 to 8",
+    "Anthropic supports exactly one completion choice per request",
+    "stream_options.include_usage must be a boolean",
+    "This adapter supports text output only",
+    "Audio output is not supported by this adapter",
+    "Audio message content is not supported by this adapter",
     "Provider endpoint fields cannot be selected by the request",
     "Non-stream response exceeded the adapter limit",
     "Provider returned too many tool calls",
