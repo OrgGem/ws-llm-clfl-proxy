@@ -100,11 +100,32 @@ function authorizationServer(provider: OidcProvider): Promise<oauth.Authorizatio
   if (!pending) {
     pending = oauth
       .discoveryRequest(provider.issuer, { algorithm: "oidc" })
-      .then((response) => oauth.processDiscoveryResponse(provider.issuer, response));
+      .then((response) => oauth.processDiscoveryResponse(provider.issuer, response))
+      .then((as) => {
+        for (const name of ["authorization_endpoint", "token_endpoint", "jwks_uri", "userinfo_endpoint"] as const) {
+          const endpoint = as[name];
+          if (endpoint !== undefined && !isPublicHttpsEndpoint(endpoint)) {
+            throw new Error(`OIDC provider ${name} must use a public HTTPS URL`);
+          }
+        }
+        return as;
+      });
     discoveryCache.set(key, pending);
     pending.catch(() => discoveryCache.delete(key));
   }
   return pending;
+}
+
+export function isPublicHttpsEndpoint(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+    return url.protocol === "https:" && !url.username && !url.password && !url.hash &&
+      hostname.includes(".") && !hostname.includes(":") && !/^\d+(?:\.\d+){3}$/.test(hostname) &&
+      hostname !== "localhost" && !hostname.endsWith(".localhost") && !hostname.endsWith(".local") && !hostname.endsWith(".internal");
+  } catch {
+    return false;
+  }
 }
 
 export async function createOidcAuthorizationRequest(provider: OidcProvider): Promise<{
@@ -117,7 +138,7 @@ export async function createOidcAuthorizationRequest(provider: OidcProvider): Pr
   const as = await authorizationServer(provider);
   if (!as.authorization_endpoint) throw new Error("OIDC provider has no authorization endpoint");
   const endpoint = new URL(as.authorization_endpoint);
-  if (!isSafeOrigin(endpoint)) throw new Error("OIDC provider authorization endpoint is not HTTPS");
+  if (!isPublicHttpsEndpoint(endpoint.href)) throw new Error("OIDC provider authorization endpoint is not public HTTPS");
   const client: oauth.Client = { client_id: provider.clientId };
   const state = oauth.generateRandomState();
   const nonce = oauth.generateRandomNonce();

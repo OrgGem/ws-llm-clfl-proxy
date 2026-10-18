@@ -1,4 +1,4 @@
-import { generateKeyPairSync, randomBytes } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
@@ -8,6 +8,9 @@ const integrationDir = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(integrationDir, "..");
 const issuer = "https://ws-llm-identity-staging.rpa-money.workers.dev";
 const kid = "integration-signing-key";
+const bootstrapPassword = randomBytes(48).toString("base64url");
+const bootstrapPasswordHash = createHash("sha256").update(bootstrapPassword).digest("base64url");
+const bootstrapPasswordExpiresAt = Math.floor(Date.now() / 1000) + 24 * 60 * 60;
 const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
 const privateJwk = { ...privateKey.export({ format: "jwk" }), kid, alg: "ES256", use: "sig" };
 const publicJwk = { ...publicKey.export({ format: "jwk" }), kid, alg: "ES256", use: "sig" };
@@ -36,7 +39,15 @@ const bindings = {
   MACHINE_JWT_PUBLIC_JWKS: JSON.stringify({ keys: [publicJwk] }),
   ENVELOPE_KEYS: JSON.stringify({ current: "integration-envelope-key", keys: { "integration-envelope-key": randomBytes(32).toString("base64url") } }),
   OIDC_PROVIDERS: oidcProviders,
+  OIDC_ISSUER_ALLOWLIST: JSON.stringify([
+    "https://accounts.google.com",
+    "https://oidc-a.integration.test/tenant",
+    "https://oidc-b.integration.test/tenant",
+  ]),
   BOOTSTRAP_ADMIN_EMAILS: "",
+  BOOTSTRAP_PASSWORD_HASH: bootstrapPasswordHash,
+  BOOTSTRAP_PASSWORD_EXPIRES_AT: String(bootstrapPasswordExpiresAt),
+  INTEGRATION_BOOTSTRAP_PASSWORD: bootstrapPassword,
 };
 
 export default defineConfig({

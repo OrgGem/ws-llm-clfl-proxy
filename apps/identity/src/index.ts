@@ -4,6 +4,7 @@ import { handleBrowserApi, handleLogout, handlePublicPairing, handleTokenRequest
 import { assertBrowserWrite, clearAuthCookies, csrfCookie, getWebActor, json, publicOrigin, secureHeaders, sessionCookie, setCookie } from "./http.js";
 import { createOidcAuthorizationRequest, parseOidcProviders, processOidcCallback, safeReturnTo, type OidcTransaction } from "./oidc.js";
 import { constantTimeEqual, newId, randomToken, sha256Base64Url } from "./security.js";
+import { bootstrapClosureStatements, bootstrapEmailsForAllowlist, handleSetupApi, loadEffectiveOidcConfig, type SetupEnv } from "./bootstrap.js";
 
 export { IdentityInternal };
 
@@ -35,7 +36,9 @@ function textResponse(message: string, status: number): Response {
 async function beginOidc(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const providerId = url.searchParams.get("provider");
-  const providers = parseOidcProviders(env.OIDC_PROVIDERS);
+  let providers;
+  try { providers = (await loadEffectiveOidcConfig(env as SetupEnv)).providers; }
+  catch { return textResponse("Sign-in is not available for this provider.", 503); }
   const provider = providers.find((candidate) => candidate.id === providerId) ?? (providerId ? undefined : providers[0]);
   if (!provider) return redirect("/");
   const now = Math.floor(Date.now() / 1000);
@@ -63,7 +66,10 @@ async function completeOidc(request: Request, env: Env): Promise<Response> {
   if (!/^[A-Za-z0-9_-]{20,256}$/.test(state)) {
     return textResponse("Sign-in could not be completed. Please start again.", 400);
   }
-  const providers = parseOidcProviders(env.OIDC_PROVIDERS);
+  let oidcConfig;
+  try { oidcConfig = await loadEffectiveOidcConfig(env as SetupEnv); }
+  catch { return textResponse("Sign-in could not be completed. Please start again.", 503); }
+  const providers = oidcConfig.providers;
   const cookieName = `__Host-oidc_${state}`;
   const cookieValue = readCookie(request.headers.get("cookie"), cookieName);
   if (!cookieValue || !constantTimeEqual(cookieValue, state)) {
@@ -102,7 +108,7 @@ async function completeOidc(request: Request, env: Env): Promise<Response> {
   }
   let decision;
   try {
-    decision = await decideOidcAllowlist(env.DB, identity, env.BOOTSTRAP_ADMIN_EMAILS, now);
+    decision = await decideOidcAllowlist(env.DB, identity, bootstrapEmailsForAllowlist(oidcConfig), now);
   } catch {
     return textResponse("Identity could not complete sign-in right now.", 503);
   }
@@ -116,9 +122,11 @@ async function completeOidc(request: Request, env: Env): Promise<Response> {
     const browserToken = randomToken(32);
     const csrfToken = randomToken(32);
     const sessionId = newId("web");
-    await env.DB.prepare(
+    const createSession = env.DB.prepare(
       "INSERT INTO sessions (id,user_id,project_id,kind,browser_token_hash,csrf_token_hash,device_name,created_at,expires_at,last_seen_at) VALUES (?,?,?,'web',?,?,?, ?,?,?)",
-    ).bind(sessionId, user.id, user.projectId, await sha256Base64Url(browserToken), await sha256Base64Url(csrfToken), "browser", now, now + WEB_SESSION_TTL_SECONDS, now).run();
+    ).bind(sessionId, user.id, user.projectId, await sha256Base64Url(browserToken), await sha256Base64Url(csrfToken), "browser", now, now + WEB_SESSION_TTL_SECONDS, now);
+    if (user.isAdmin) await env.DB.batch([createSession, ...bootstrapClosureStatements(env.DB, now)]);
+    else await createSession.run();
     await insertAudit(env.DB, user.id, "session.created", "session", sessionId, { kind: "web" });
     let response = redirect(safeReturnTo(row.return_to));
     response = setCookie(response, `${cookieName}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`);
@@ -174,6 +182,10 @@ async function fetchIdentity(request: Request, env: Env): Promise<Response> {
   if (path === "/health" && request.method === "GET") return json({ status: "ok" });
   if ((path === "/auth/oidc/start" || path === "/auth/login") && request.method === "GET") return beginOidc(request, env);
   if (path === "/auth/oidc/callback" && request.method === "GET") return completeOidc(request, env);
+  if (path.startsWith("/api/setup/")) {
+    const setupResponse = await handleSetupApi(request, env as SetupEnv);
+    if (setupResponse) return setupResponse;
+  }
   if (path === "/oauth/token") return handleTokenRequest(request, env);
   if (path === "/pairing/start" || path === "/pairing/token") return handlePublicPairing(request, env);
   if (path === "/api/session" && request.method === "GET") return sessionResponse(request, env);

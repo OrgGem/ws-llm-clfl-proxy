@@ -13,6 +13,7 @@ export interface ApiClient {
   request(path: string, options?: { method?: string; body?: unknown; headers?: HeadersInit }): Promise<unknown>;
   get(path: string, query?: Record<string, string | number | boolean | undefined | null>): Promise<unknown>;
   post(path: string, body?: unknown): Promise<unknown>;
+  postSetupLogin(body?: unknown): Promise<unknown>;
   put(path: string, body?: unknown): Promise<unknown>;
   delete(path: string): Promise<unknown>;
 }

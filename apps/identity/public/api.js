@@ -32,7 +32,8 @@ export function createApiClient({
     const headers = new Headers(suppliedHeaders);
     headers.set("Accept", "application/json");
     if (body !== undefined) headers.set("Content-Type", "application/json");
-    if (!SAFE_METHODS.has(normalizedMethod)) {
+    const setupLoginException = normalizedMethod === "POST" && target.pathname === "/api/setup/login";
+    if (!SAFE_METHODS.has(normalizedMethod) && !setupLoginException) {
       const csrfToken = getCsrfToken();
       if (!csrfToken) throw new ApiError(403, "Your session expired. Sign in again.");
       headers.set("X-CSRF-Token", csrfToken);
@@ -83,6 +84,9 @@ export function createApiClient({
     },
     post(path, body) {
       return request(path, { method: "POST", body });
+    },
+    postSetupLogin(body) {
+      return request("/api/setup/login", { method: "POST", body });
     },
     put(path, body) {
       return request(path, { method: "PUT", body });

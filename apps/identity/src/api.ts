@@ -2,7 +2,7 @@ import { createCredentialEnvelope, newId, randomToken, readJson, readTextBody, R
 import { insertAudit, rateLimit } from "./db.js";
 import { assertBrowserWrite, forbidden, getWebActor, json, publicOrigin, sourceAddress, type WebActor } from "./http.js";
 import { handleManagementApi } from "./management.js";
-import { parseOidcProviders } from "./oidc.js";
+import { loadEffectiveOidcConfig, type SetupEnv } from "./bootstrap.js";
 
 const SESSION_MAX_AGE = 12 * 60 * 60;
 const REFRESH_MAX_AGE = 30 * 24 * 60 * 60;
@@ -85,7 +85,12 @@ async function userProjects(env: Env, actor: WebActor): Promise<Array<{ id: stri
 }
 
 export async function sessionResponse(request: Request, env: Env): Promise<Response> {
-  const providers = parseOidcProviders(env.OIDC_PROVIDERS).map(({ id, label }) => ({ id, label }));
+  let providers: Array<{ id: string; label: string }>;
+  try {
+    providers = (await loadEffectiveOidcConfig(env as SetupEnv)).providers.map(({ id, label }) => ({ id, label }));
+  } catch {
+    return json({ error: "configuration_unavailable" }, 503);
+  }
   const actor = await getWebActor(request, env);
   if (!actor) return json({ authenticated: false, loginProviders: providers, authSetupRequired: providers.length === 0 });
   const projects = await userProjects(env, actor);

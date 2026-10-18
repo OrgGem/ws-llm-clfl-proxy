@@ -1,11 +1,17 @@
-import { ApiError, createApiClient } from "/api.js";
-import { safeBootstrapMetadata } from "/bootstrap.js";
-import { isTimestampExpired, timestampMilliseconds } from "/dates.js";
+import { ApiError, createApiClient } from "./api.js";
+import { safeBootstrapMetadata } from "./bootstrap.js";
+import { isTimestampExpired, timestampMilliseconds } from "./dates.js";
 
 const app = document.getElementById("app");
 const state = {
   session: undefined,
   csrfToken: undefined,
+  setupStatus: undefined,
+  setupCsrfToken: undefined,
+  setupConfig: undefined,
+  setupError: undefined,
+  setupSaved: false,
+  setupAdminMode: false,
   projectId: undefined,
   view: "overview",
   main: undefined,
@@ -13,7 +19,7 @@ const state = {
   busy: false,
 };
 
-const api = createApiClient({ getCsrfToken: () => state.csrfToken });
+const api = createApiClient({ getCsrfToken: () => state.csrfToken ?? state.setupCsrfToken });
 
 const VIEWS = {
   overview: {
@@ -186,6 +192,9 @@ function confirmAction(message) {
 function setBusy(value) {
   state.busy = value;
   app?.setAttribute("aria-busy", value ? "true" : "false");
+  for (const control of app?.querySelectorAll("[data-busy-disabled]") ?? []) {
+    control.disabled = value;
+  }
 }
 
 async function runAction(action, successMessage) {
@@ -313,11 +322,17 @@ function pageHeader(viewKey = state.view) {
   );
 }
 
-function renderLogin(session = {}) {
+function renderLogin(session = {}, setupStatus = {}) {
   state.session = undefined;
   state.csrfToken = undefined;
+  state.setupStatus = isRecord(setupStatus) ? setupStatus : undefined;
+  state.setupCsrfToken = undefined;
+  state.setupConfig = undefined;
+  state.setupSaved = false;
+  state.setupAdminMode = false;
   setBusy(false);
   const providers = list(session.loginProviders);
+  const setupAvailable = setupStatus.bootstrapAvailable === true;
   const loginLinks = providers.map((provider) => {
     const id = typeof provider.id === "string" ? provider.id : "";
     const label = display(provider.label, "Sign in");
@@ -325,22 +340,291 @@ function renderLogin(session = {}) {
     return h("a", { className: "login-provider", href: path }, h("span", {}, label), h("span", { "aria-hidden": "true" }, "↗"));
   });
   const message = session.authSetupRequired
-    ? "Sign-in has not been configured yet. Ask the service administrator to finish Identity setup."
+    ? setupAvailable
+      ? "Organization sign-in is not configured yet. Use the temporary setup password to connect an OIDC provider."
+      : "Sign-in has not been configured yet. Ask the service administrator to finish Identity setup."
     : providers.length
       ? "Sign in with your organization account to manage Gateway access."
       : "No sign-in provider is available. Ask the service administrator to configure OIDC.";
+  const password = h("input", {
+    className: "input",
+    type: "password",
+    name: "setup-password",
+    autocomplete: "current-password",
+    required: "",
+    maxlength: 512,
+    spellcheck: "false",
+    autocapitalize: "off",
+  });
+  const setupLoginForm = setupAvailable ? h("form", {
+    className: "setup-login-form",
+    onSubmit: (event) => { event.preventDefault(); void submitSetupLogin(password); },
+  },
+    h("div", { className: "setup-section-heading" },
+      h("h2", {}, "First-time OIDC setup"),
+      h("p", { className: "field-help" }, "Use the temporary password delivered to the service owner. This access can only configure OIDC; it cannot manage clients, projects, or credentials."),
+    ),
+    state.setupError ? alertBox(state.setupError) : null,
+    field("Temporary setup password", password, "The password expires after 24 hours and is disabled after the first successful OIDC admin sign-in."),
+    h("div", { className: "form-actions" }, h("button", { type: "submit", className: "button primary", disabled: state.busy, "data-busy-disabled": "true" }, "Continue setup")),
+  ) : null;
   const content = h("main", { className: "auth-screen" },
     h("section", { className: "login-card" },
       h("div", { className: "brand-mark", "aria-hidden": "true" }, "L"),
       h("p", { className: "eyebrow" }, "LLM Gateway control room"),
       h("h1", {}, "Manage access with confidence"),
       h("p", { className: "page-description" }, message),
-      providers.length ? h("div", { className: "login-provider-list" }, ...loginLinks) : notice(message, "warning"),
+      providers.length ? h("div", { className: "login-provider-list" }, ...loginLinks) : notice(message, setupAvailable ? "info" : "warning"),
       h("p", { className: "field-help login-note" }, "Your sign-in identity is separate from the provider API keys managed inside this console."),
+      setupLoginForm,
     ),
   );
   app.replaceChildren(content);
   app.setAttribute("aria-busy", "false");
+}
+
+function setupIssuerList(config = state.setupConfig) {
+  const values = Array.isArray(config?.allowedIssuers) ? config.allowedIssuers : state.setupStatus?.allowedIssuers;
+  return Array.isArray(values) ? values.filter((value) => typeof value === "string" && value.startsWith("https://")) : [];
+}
+
+function isGoogleIssuer(value) {
+  try {
+    const url = new URL(value);
+    return url.origin === "https://accounts.google.com" && url.pathname === "/" && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+function providerDefaults(config = state.setupConfig) {
+  const existing = list(config?.providers);
+  const issuers = setupIssuerList(config);
+  const provider = existing[0];
+  const issuer = typeof provider?.issuer === "string"
+    ? provider.issuer
+    : issuers.find(isGoogleIssuer) ?? issuers[0] ?? "https://accounts.google.com";
+  let host = "google";
+  try { host = new URL(issuer).hostname.replace(/^www\./, ""); } catch { /* use the safe fallback */ }
+  const isGoogle = isGoogleIssuer(issuer);
+  return {
+    id: display(provider?.id, isGoogle ? "google" : host.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32)),
+    label: display(provider?.label, isGoogle ? "Google" : host),
+    issuer,
+    clientId: typeof provider?.clientId === "string" ? provider.clientId : "",
+    hasClientSecret: provider?.hasClientSecret === true,
+  };
+}
+
+function renderSetupPage() {
+  const config = isRecord(state.setupConfig) ? state.setupConfig : {};
+  const adminMode = state.setupAdminMode === true;
+  const defaults = providerDefaults(config);
+  const issuers = setupIssuerList(config);
+  const issuerOptions = [...new Set([...issuers, defaults.issuer])];
+  const providerId = h("input", { className: "input", value: defaults.id, required: "", maxlength: 32, pattern: "[a-z][a-z0-9_-]{0,31}", autocomplete: "off", spellcheck: "false" });
+  const label = h("input", { className: "input", value: defaults.label, required: "", maxlength: 80, autocomplete: "off" });
+  const issuer = h("select", { className: "select", required: "", value: defaults.issuer }, ...issuerOptions.map((value) => h("option", { value, selected: value === defaults.issuer }, value)));
+  const clientId = h("input", { className: "input", value: defaults.clientId, required: "", maxlength: 512, autocomplete: "off", spellcheck: "false" });
+  const clientSecret = h("input", { className: "input", type: "password", required: defaults.hasClientSecret ? undefined : "", maxlength: 2048, autocomplete: "new-password", spellcheck: "false" });
+  const adminEmails = h("textarea", {
+    className: "textarea",
+    required: "",
+    maxlength: 8192,
+    autocomplete: "off",
+    placeholder: "admin@example.com",
+    value: Array.isArray(config.bootstrapAdminEmails) ? config.bootstrapAdminEmails.join("\n") : "",
+  });
+  issuer.addEventListener("change", () => {
+    let host = "provider";
+    try { host = new URL(issuer.value).hostname.replace(/^www\./, ""); } catch { /* keep fallback */ }
+    const isGoogle = isGoogleIssuer(issuer.value);
+    if (providerId.value === "google" || providerId.value === "") {
+      providerId.value = isGoogle ? "google" : host.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32);
+    }
+    if (label.value === "Google" || label.value === "") label.value = isGoogle ? "Google" : host;
+  });
+  const callback = typeof config.redirectUri === "string"
+    ? config.redirectUri
+    : typeof state.setupStatus?.redirectUri === "string"
+      ? state.setupStatus.redirectUri
+      : "Unavailable";
+  const signInLinks = list(config.providers).map((provider) => {
+    const id = typeof provider.id === "string" ? provider.id : "";
+    if (!id) return null;
+    return h("a", { className: "login-provider", href: `/auth/oidc/start?provider=${encodeURIComponent(id)}` },
+      h("span", {}, `Sign in with ${display(provider.label, id)}`), h("span", { "aria-hidden": "true" }, "↗"));
+  }).filter(Boolean);
+  const form = h("form", {
+    className: "setup-config-form",
+    onSubmit: (event) => {
+      event.preventDefault();
+      void saveSetupOidc({ providerId, label, issuer, clientId, clientSecret, adminEmails });
+    },
+  },
+    h("div", { className: "form-grid" },
+      field("Provider ID", providerId, "Used in the sign-in URL. Use lowercase letters, numbers, underscores, or hyphens."),
+      field("Display name", label),
+      field("OIDC issuer", issuer, "Use one of the issuer URLs allowed by the service owner."),
+      field("OAuth client ID", clientId, "Create a web application client in your identity provider."),
+      field("OAuth client secret", clientSecret, defaults.hasClientSecret ? "A secret is already saved. Leave this blank to keep it, or enter a replacement." : "Enter the client secret from your identity provider.", true),
+      field("Bootstrap admin email addresses", adminEmails, "One email address per line. The first matching verified account receives initial admin access; other accounts need approval in Security.", true),
+    ),
+    h("div", { className: "notice setup-callback" },
+      h("span", { className: "notice-icon", "aria-hidden": "true" }, "i"),
+      h("span", {}, "Register this exact callback URL in your identity provider: ", h("code", { className: "monospace setup-callback-url" }, callback || "Unavailable")),
+    ),
+    h("p", { className: "field-help setup-instructions" }, "For Google, add a Web application OAuth client in Google Cloud Console, register the callback above, then save and sign in. The setup password stays available until the first successful OIDC administrator sign-in."),
+    state.setupError ? alertBox(state.setupError) : null,
+    state.setupSaved ? notice("OIDC settings saved. Sign in with the configured provider to finish setup.") : null,
+    h("div", { className: "form-actions" },
+      h("button", { type: "submit", className: "button primary", disabled: state.busy, "data-busy-disabled": "true" }, "Save OIDC settings"),
+      h("button", { type: "button", className: "button secondary", disabled: state.busy, "data-busy-disabled": "true", onClick: adminMode ? exitAdminOidcSettings : signOutSetup }, adminMode ? "Back to Security" : "Sign out of setup"),
+    ),
+  );
+  const content = h("main", { className: "auth-screen setup-screen" },
+    h("section", { className: "login-card setup-card" },
+      h("div", { className: "brand-mark", "aria-hidden": "true" }, "L"),
+      h("p", { className: "eyebrow" }, "LLM Gateway control room"),
+      h("h1", {}, adminMode ? "Manage organization sign-in" : "Connect organization sign-in"),
+      h("p", { className: "page-description" }, adminMode
+        ? "Update the OIDC providers used for Identity sign-in. Provider client secrets are write-only and are never shown here."
+        : "This temporary setup access can configure OIDC only. It cannot manage projects, clients, or provider credentials."),
+      signInLinks.length ? h("div", { className: "login-provider-list setup-existing-providers" }, ...signInLinks) : null,
+      form,
+    ),
+  );
+  app.replaceChildren(content);
+  app.setAttribute("aria-busy", state.busy ? "true" : "false");
+}
+
+async function submitSetupLogin(password) {
+  if (state.busy) return;
+  const value = password.value;
+  password.value = "";
+  state.setupError = undefined;
+  setBusy(true);
+  try {
+    const login = await api.postSetupLogin({ password: value });
+    state.setupCsrfToken = typeof login?.csrfToken === "string" ? login.csrfToken : undefined;
+    const status = await api.get("/api/setup/status");
+    if (!isRecord(status) || status.authenticated !== true) throw new ApiError(401, "Setup access expired. Sign in again.");
+    state.setupStatus = status;
+    state.setupCsrfToken = typeof status.csrfToken === "string" ? status.csrfToken : state.setupCsrfToken;
+    if (!state.setupCsrfToken) throw new ApiError(403, "Setup access expired. Sign in again.");
+    state.setupConfig = await api.get("/api/setup/oidc");
+    state.setupSaved = false;
+    renderSetupPage();
+  } catch (error) {
+    state.setupError = error instanceof ApiError && error.status === 429
+      ? "Too many setup login attempts. Wait a moment and try again."
+      : error instanceof ApiError && error.status === 401
+        ? "The setup password is invalid or has expired. Check the service owner’s instructions and try again."
+        : error instanceof Error ? error.message : "Setup could not be opened. Try again.";
+    state.setupCsrfToken = undefined;
+    let status = state.setupStatus;
+    try { status = await api.get("/api/setup/status"); } catch { /* retain the last public status */ }
+    renderLogin({}, isRecord(status) ? status : {});
+  } finally {
+    setBusy(false);
+  }
+}
+
+function parseAdminEmails(value) {
+  const emails = value.split(/[\n,;]/).map((item) => item.trim()).filter(Boolean);
+  const valid = emails.length > 0 && emails.every((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
+  return valid ? [...new Set(emails)] : undefined;
+}
+
+async function saveSetupOidc(fields) {
+  if (state.busy) return;
+  const secret = fields.clientSecret.value;
+  fields.clientSecret.value = "";
+  state.setupError = undefined;
+  state.setupSaved = false;
+  const emails = parseAdminEmails(fields.adminEmails.value);
+  if (!emails) {
+    state.setupError = "Enter at least one valid administrator email address.";
+    renderSetupPage();
+    return;
+  }
+  const id = fields.providerId.value.trim();
+  const label = fields.label.value.trim();
+  const issuer = fields.issuer.value;
+  const clientId = fields.clientId.value.trim();
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id) || !label || label.length > 80 || !setupIssuerList().includes(issuer) || !clientId) {
+    state.setupError = "Check the provider ID, display name, allowed issuer, and client ID.";
+    renderSetupPage();
+    return;
+  }
+  const existing = list(state.setupConfig?.providers);
+  const sameProvider = existing.find((provider) => provider.id === id && provider.issuer === issuer && provider.clientId === clientId);
+  if (!secret && sameProvider?.hasClientSecret !== true) {
+    state.setupError = "Enter the OAuth client secret for this provider.";
+    renderSetupPage();
+    return;
+  }
+  const providers = existing.filter((provider) => provider.id !== id).map((provider) => ({
+    id: provider.id,
+    label: provider.label,
+    issuer: provider.issuer,
+    clientId: provider.clientId,
+  }));
+  const selected = { id, label, issuer, clientId };
+  if (secret) selected.clientSecret = secret;
+  providers.push(selected);
+  setBusy(true);
+  try {
+    state.setupConfig = await api.put("/api/setup/oidc", { providers, bootstrapAdminEmails: emails });
+    state.setupSaved = true;
+    renderSetupPage();
+  } catch (error) {
+    state.setupError = error instanceof Error ? error.message : "OIDC settings could not be saved.";
+    renderSetupPage();
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function signOutSetup() {
+  if (state.busy) return;
+  setBusy(true);
+  try {
+    await api.post("/api/setup/logout", {});
+    state.setupCsrfToken = undefined;
+    state.setupStatus = undefined;
+    state.setupConfig = undefined;
+    state.setupError = undefined;
+    await initialize();
+  } catch (error) {
+    state.setupError = error instanceof Error ? error.message : "Setup sign-out failed.";
+    renderSetupPage();
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function editAdminOidcSettings() {
+  if (state.busy) return;
+  setBusy(true);
+  try {
+    state.setupConfig = await api.get("/api/setup/oidc");
+    state.setupAdminMode = true;
+    state.setupError = undefined;
+    state.setupSaved = false;
+    renderSetupPage();
+  } catch (error) {
+    showPageError(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function exitAdminOidcSettings() {
+  state.setupAdminMode = false;
+  state.setupConfig = undefined;
+  state.setupError = undefined;
+  await initialize();
 }
 
 function projectIdOf(project) {
@@ -465,8 +749,8 @@ async function signOut() {
     await api.post("/api/logout", {});
     state.session = undefined;
     state.csrfToken = undefined;
-    const session = await api.get("/api/session");
-    renderLogin(isRecord(session) ? session : {});
+    state.setupCsrfToken = undefined;
+    await initialize();
   } catch (error) {
     showPageError(error);
   } finally {
@@ -479,9 +763,37 @@ async function initialize() {
   try {
     const session = await api.get("/api/session");
     if (!isRecord(session) || session.authenticated !== true) {
-      renderLogin(isRecord(session) ? session : {});
+      state.setupStatus = undefined;
+      state.setupCsrfToken = undefined;
+      state.setupConfig = undefined;
+      state.setupError = undefined;
+      let setupStatus = {};
+      try {
+        const status = await api.get("/api/setup/status");
+        if (isRecord(status)) setupStatus = status;
+      } catch { /* OIDC login must remain available if setup status is unavailable */ }
+      if (setupStatus.authenticated === true) {
+        state.setupStatus = setupStatus;
+        state.setupCsrfToken = typeof setupStatus.csrfToken === "string" ? setupStatus.csrfToken : undefined;
+        try {
+          state.setupConfig = await api.get("/api/setup/oidc");
+          renderSetupPage();
+          return;
+        } catch {
+          state.setupCsrfToken = undefined;
+          state.setupError = "Setup access expired. Sign in again to continue.";
+          try {
+            const refreshed = await api.get("/api/setup/status");
+            if (isRecord(refreshed)) setupStatus = refreshed;
+          } catch { /* render the ordinary login even if status cannot be refreshed */ }
+        }
+      }
+      renderLogin(isRecord(session) ? session : {}, setupStatus);
       return;
     }
+    state.setupCsrfToken = undefined;
+    state.setupStatus = undefined;
+    state.setupConfig = undefined;
     state.session = session;
     state.csrfToken = typeof session.csrfToken === "string" ? session.csrfToken : undefined;
     const projects = list(session.projects);
@@ -1161,7 +1473,7 @@ async function renderSecurity() {
 
   return [
     notice("System login, Gateway access tokens, and LLM provider keys have separate roles. OIDC signs in a human; machine tokens authorize a client; provider API keys authorize upstream model calls.", "info"),
-    panel("Identity boundaries", "Review the configured sign-in and token issuers separately.", identityContent),
+    panel("Identity boundaries", "Review the configured sign-in and token issuers separately.", identityContent, button("Edit OIDC settings", editAdminOidcSettings, "secondary")),
     h("div", { className: "section-grid two" }, panel("Token signing keys", "Key IDs only. Private signing material never appears in the browser.", keyList), panel("Pending identities", "Approve only identities you can verify.", pendingList)),
     h("div", { className: "section-grid two" }, panel("Allowlisted users", "Access is keyed by OIDC issuer and subject, not email alone.", allowlistContent), panel("Recent audit activity", "Metadata only. Prompts, responses, keys, and tokens are excluded.", auditContent)),
   ];

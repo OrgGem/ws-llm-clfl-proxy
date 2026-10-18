@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { parseOidcProviders, processOidcCallback, type OidcTransaction } from "../src/oidc.js";
+import { isPublicHttpsEndpoint, parseOidcProviders, processOidcCallback, type OidcTransaction } from "../src/oidc.js";
+
+describe("OIDC endpoint SSRF boundaries", () => {
+  it("accepts public HTTPS endpoints and rejects local, literal-IP, or non-HTTPS endpoints", () => {
+    expect(isPublicHttpsEndpoint("https://oauth2.googleapis.com/token")).toBe(true);
+    expect(isPublicHttpsEndpoint("https://127.0.0.1/token")).toBe(false);
+    expect(isPublicHttpsEndpoint("https://[::1]/token")).toBe(false);
+    expect(isPublicHttpsEndpoint("https://metadata.internal/token")).toBe(false);
+    expect(isPublicHttpsEndpoint("http://identity.example.test/token")).toBe(false);
+  });
+});
 
 describe("OIDC callback binding", () => {
   it("keeps query-free registered callback URIs and pinned issuer paths intact", () => {

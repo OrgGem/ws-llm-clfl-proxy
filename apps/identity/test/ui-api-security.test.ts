@@ -78,6 +78,29 @@ describe("Identity browser API client", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it("omits CSRF only for the exact setup login POST", async () => {
+    const password = "temporary-bootstrap-password";
+    let requestUrl: URL | undefined;
+    let requestInit: RequestInit | undefined;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = new URL(input instanceof Request ? input.url : String(input));
+      requestInit = init;
+      return new Response(JSON.stringify({ csrfToken: "setup-csrf" }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const api = createApiClient({ origin: "https://identity.example.test", fetchImpl });
+
+    await api.postSetupLogin({ password });
+
+    expect(requestUrl?.pathname).toBe("/api/setup/login");
+    expect(requestUrl?.search).toBe("");
+    expect(requestInit?.method).toBe("POST");
+    expect(new Headers(requestInit?.headers).has("X-CSRF-Token")).toBe(false);
+    expect(requestInit?.body).toBe(JSON.stringify({ password }));
+    await expect(api.post("/api/setup/oidc", { providers: [] })).rejects.toMatchObject({ status: 403 });
+    await expect(api.request("/api/setup/login", { method: "PUT", body: { password } })).rejects.toMatchObject({ status: 403 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("does not echo error response bodies that could contain submitted secrets", async () => {
     const secret = "provider-secret-never-echo";
     const api = createApiClient({

@@ -244,6 +244,18 @@ tr:last-child td { border-bottom: 0; }
 .login-provider-list { display: grid; gap: 9px; }
 .login-provider { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 9px; background: white; color: var(--ink); text-decoration: none; font-weight: 650; }
 .login-provider:hover { border-color: #99cab4; background: #f6faf7; }
+.setup-login-form { display: grid; gap: 14px; margin-top: 22px; padding-top: 21px; border-top: 1px solid #e7ece8; }
+.setup-login-form .setup-section-heading h2 { margin-bottom: 7px; }
+.setup-login-form .form-actions { margin-top: 0; }
+.setup-screen { align-content: start; padding-top: 32px; padding-bottom: 32px; }
+.setup-card { width: min(100%, 760px); }
+.setup-existing-providers { margin: 0 0 20px; }
+.setup-config-form { display: grid; gap: 14px; }
+.setup-config-form .form-actions { margin-top: 0; }
+.setup-callback { display: block; overflow-wrap: anywhere; }
+.setup-callback .notice-icon { display: inline-block; margin-right: 8px; }
+.setup-callback-url { overflow-wrap: anywhere; }
+.setup-instructions { margin: 0; }
 .dialog-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 20px; background: rgb(12 29 30 / 55%); }
 .dialog-card { width: min(100%, 550px); max-height: min(90vh, 760px); overflow: auto; padding: 22px; border: 1px solid #d8e0db; border-radius: 15px; background: white; box-shadow: 0 28px 80px rgb(5 22 23 / 30%); }
 .dialog-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; margin-bottom: 15px; }

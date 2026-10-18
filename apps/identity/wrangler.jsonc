@@ -16,6 +16,7 @@
     "MACHINE_ISSUER": "http://localhost:8787",
     "MACHINE_JWT_PUBLIC_JWKS": "{\"keys\":[]}",
     "PUBLIC_ORIGIN": "http://localhost:8787",
+    "OIDC_ISSUER_ALLOWLIST": "[\"https://accounts.google.com\"]",
     "GATEWAY_URL": "ws://localhost:8788/v1/socket"
   },
   "triggers": {
@@ -67,6 +68,7 @@
         "MACHINE_ISSUER": "https://llm.gemslab.id.vn",
         "MACHINE_JWT_PUBLIC_JWKS": "{\"keys\":[{\"kty\":\"EC\",\"x\":\"WX6IKbhoxGQt6paVJP2NgSOplMfZLLWcwh-XPO8o2b4\",\"y\":\"2UDsySDcD8UAMnEVuTd3VRB_ZcdFMz4ujSjvdubfXZM\",\"crv\":\"P-256\",\"kid\":\"staging-bc8f93c38620f52f\",\"alg\":\"ES256\",\"use\":\"sig\"}]}",
         "PUBLIC_ORIGIN": "https://llm.gemslab.id.vn",
+        "OIDC_ISSUER_ALLOWLIST": "[\"https://accounts.google.com\"]",
         "GATEWAY_URL": "wss://llm.gemslab.id.vn/v1/socket"
       },
       "d1_databases": [
