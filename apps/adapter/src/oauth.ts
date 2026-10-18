@@ -971,4 +971,3 @@ function safeOAuthError(error: unknown, code: string, message: string): OAuthCon
 function isInvalidGrant(error: unknown): boolean {
   return error instanceof OAuthConnectorError && error.code === "invalid_grant";
 }
-
