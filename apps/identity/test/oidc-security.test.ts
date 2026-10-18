@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isPublicHttpsEndpoint, parseOidcProviders, processOidcCallback, type OidcTransaction } from "../src/oidc.js";
+import { isPublicHttpsEndpoint, OidcCallbackFailure, parseOidcProviders, processOidcCallback, type OidcTransaction } from "../src/oidc.js";
 
 describe("OIDC endpoint SSRF boundaries", () => {
   it("accepts public HTTPS endpoints and rejects local, literal-IP, or non-HTTPS endpoints", () => {
@@ -45,7 +45,15 @@ describe("OIDC callback binding", () => {
       expiresAt: Math.floor(Date.now() / 1000) + 60,
     };
     const validQueryState = new URL("https://identity.example.test/auth/oidc/callback?code=authorization-code&state=browser-bound-state");
-    await expect(processOidcCallback(provider, validQueryState, transaction, undefined)).rejects.toThrow(/state validation/i);
-    await expect(processOidcCallback(provider, validQueryState, transaction, "attacker-state")).rejects.toThrow(/state validation/i);
+    await expect(processOidcCallback(provider, validQueryState, transaction, undefined)).rejects.toMatchObject({
+      constructor: OidcCallbackFailure,
+      stage: "auth_response",
+      reason: "OAUTH_INVALID_REQUEST",
+    });
+    await expect(processOidcCallback(provider, validQueryState, transaction, "attacker-state")).rejects.toMatchObject({
+      constructor: OidcCallbackFailure,
+      stage: "auth_response",
+      reason: "OAUTH_INVALID_REQUEST",
+    });
   });
 });

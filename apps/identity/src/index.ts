@@ -2,7 +2,7 @@ import { IdentityInternal } from "./identity-service.js";
 import { cleanupTransientRows, decideOidcAllowlist, ensureOidcUser, insertAudit, rateLimit } from "./db.js";
 import { handleBrowserApi, handleLogout, handlePublicPairing, handleTokenRequest, sessionResponse, handleBodyError } from "./api.js";
 import { assertBrowserWrite, clearAuthCookies, csrfCookie, getWebActor, json, publicOrigin, secureHeaders, sessionCookie, setCookie } from "./http.js";
-import { createOidcAuthorizationRequest, parseOidcProviders, processOidcCallback, safeReturnTo, type OidcTransaction } from "./oidc.js";
+import { createOidcAuthorizationRequest, OidcCallbackFailure, parseOidcProviders, processOidcCallback, safeReturnTo, type OidcTransaction } from "./oidc.js";
 import { constantTimeEqual, newId, randomToken, sha256Base64Url } from "./security.js";
 import { bootstrapClosureStatements, bootstrapEmailsForAllowlist, handleSetupApi, loadEffectiveOidcConfig, type SetupEnv } from "./bootstrap.js";
 
@@ -102,8 +102,16 @@ async function completeOidc(request: Request, env: Env): Promise<Response> {
       returnTo: row.return_to,
       expiresAt: row.expires_at,
     } satisfies OidcTransaction, cookieValue);
-  } catch {
-    const response = textResponse("Sign-in could not be verified. Please start again.", 401);
+  } catch (error) {
+    const friendlyMessage = "Sign-in could not be verified. Please start again.";
+    const response = textResponse(
+      error instanceof OidcCallbackFailure ? `${friendlyMessage} Reference: ${error.stage}:${error.reason}${error.claim ? `:${error.claim}` : ""}.` : friendlyMessage,
+      401,
+    );
+    if (error instanceof OidcCallbackFailure) {
+      const classification = [error.stage, error.reason, error.claim].filter(Boolean).join(":");
+      response.headers.set("x-oidc-error", classification);
+    }
     return setCookie(response, `${cookieName}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`);
   }
   let decision;

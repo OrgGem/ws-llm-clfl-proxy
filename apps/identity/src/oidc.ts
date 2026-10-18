@@ -28,6 +28,109 @@ export interface OidcTransaction {
   expiresAt: number;
 }
 
+export type OidcCallbackStage = "discovery" | "auth_response" | "token_request" | "token_response" | "signature" | "claims";
+export type OidcSafeClaim = "iss" | "aud" | "nonce" | "exp" | "iat";
+type OidcOAuthErrorName = "invalid_client" | "invalid_grant" | "invalid_request" | "unauthorized_client" | "access_denied" | "temporarily_unavailable" | "server_error";
+
+const oauthErrorNames = new Set<OidcOAuthErrorName>([
+  "invalid_client", "invalid_grant", "invalid_request", "unauthorized_client", "access_denied", "temporarily_unavailable", "server_error",
+]);
+
+const oauthLibraryCodeList = [
+  oauth.RESPONSE_BODY_ERROR,
+  oauth.UNSUPPORTED_OPERATION,
+  oauth.AUTHORIZATION_RESPONSE_ERROR,
+  oauth.JWT_USERINFO_EXPECTED,
+  oauth.PARSE_ERROR,
+  oauth.INVALID_RESPONSE,
+  oauth.INVALID_REQUEST,
+  oauth.RESPONSE_IS_NOT_JSON,
+  oauth.RESPONSE_IS_NOT_CONFORM,
+  oauth.HTTP_REQUEST_FORBIDDEN,
+  oauth.REQUEST_PROTOCOL_FORBIDDEN,
+  oauth.JWT_TIMESTAMP_CHECK,
+  oauth.JWT_CLAIM_COMPARISON,
+  oauth.JSON_ATTRIBUTE_COMPARISON,
+  oauth.KEY_SELECTION,
+  oauth.MISSING_SERVER_METADATA,
+  oauth.INVALID_SERVER_METADATA,
+] as const;
+type OidcCallbackReason = OidcOAuthErrorName | typeof oauthLibraryCodeList[number];
+const oauthLibraryCodes = new Set<string>(oauthLibraryCodeList);
+
+const callbackStages = new Set<OidcCallbackStage>(["discovery", "auth_response", "token_request", "token_response", "signature", "claims"]);
+const callbackReasons = new Set<string>([...oauthErrorNames, ...oauthLibraryCodeList]);
+
+/** Fixed, value-free classification safe to expose to operators. */
+export class OidcCallbackFailure extends Error {
+  readonly stage: OidcCallbackStage;
+  readonly reason: OidcCallbackReason;
+  readonly claim?: OidcSafeClaim;
+
+  constructor(stage: OidcCallbackStage, reason: OidcCallbackReason, claim?: OidcSafeClaim) {
+    const safeStage = callbackStages.has(stage) ? stage : "claims";
+    const safeReason = callbackReasons.has(reason) ? reason : oauth.INVALID_RESPONSE;
+    const safeClaim = isSafeClaim(claim) ? claim : undefined;
+    super(`${safeStage}:${safeReason}${safeClaim ? `:${safeClaim}` : ""}`);
+    this.name = "OidcCallbackFailure";
+    this.stage = safeStage;
+    this.reason = safeReason;
+    this.claim = safeClaim;
+  }
+}
+
+function isSafeClaim(value: unknown): value is OidcSafeClaim {
+  return value === "iss" || value === "aud" || value === "nonce" || value === "exp" || value === "iat";
+}
+
+function safeOAuthErrorName(value: unknown): OidcOAuthErrorName | undefined {
+  return typeof value === "string" && oauthErrorNames.has(value as OidcOAuthErrorName) ? value as OidcOAuthErrorName : undefined;
+}
+
+function classifyOAuthFailure(error: unknown, stage: OidcCallbackStage): OidcCallbackFailure {
+  let reason: OidcCallbackReason = oauth.INVALID_RESPONSE;
+  let claim: OidcSafeClaim | undefined;
+
+  if (error instanceof oauth.ResponseBodyError || error instanceof oauth.AuthorizationResponseError) {
+    reason = safeOAuthErrorName(error.error) ?? oauth.RESPONSE_BODY_ERROR;
+  } else if (error instanceof oauth.OperationProcessingError || error instanceof oauth.UnsupportedOperationError) {
+    if (typeof error.code === "string" && oauthLibraryCodes.has(error.code)) reason = error.code as OidcCallbackReason;
+    if (error instanceof oauth.OperationProcessingError && error.code === oauth.JWT_CLAIM_COMPARISON) {
+      const cause = error.cause;
+      if (cause && typeof cause === "object" && isSafeClaim((cause as { claim?: unknown }).claim)) {
+        claim = (cause as { claim: OidcSafeClaim }).claim;
+      }
+    }
+  }
+
+  const classifiedStage = stage === "token_response" && reason === oauth.JWT_CLAIM_COMPARISON ? "claims" : stage;
+  return new OidcCallbackFailure(classifiedStage, reason, claim);
+}
+
+async function atStage<T>(stage: OidcCallbackStage, operation: () => T | Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof OidcCallbackFailure) throw error;
+    throw classifyOAuthFailure(error, stage);
+  }
+}
+
+function failOidc(stage: OidcCallbackStage, reason: OidcCallbackReason, claim?: OidcSafeClaim): never {
+  throw new OidcCallbackFailure(stage, reason, claim);
+}
+
+function clientSecretAuthentication(as: oauth.AuthorizationServer, provider: OidcProvider): oauth.ClientAuth {
+  const advertised = as.token_endpoint_auth_methods_supported as unknown;
+  if (advertised !== undefined && !Array.isArray(advertised)) {
+    throw new oauth.UnsupportedOperationError("No supported client authentication method");
+  }
+  const supported = advertised as string[] | undefined;
+  if (supported?.includes("client_secret_post")) return oauth.ClientSecretPost(provider.clientSecret);
+  if (!supported || supported.includes("client_secret_basic")) return oauth.ClientSecretBasic(provider.clientSecret);
+  throw new oauth.UnsupportedOperationError("No supported client authentication method");
+}
+
 interface RawOidcProvider {
   id: string;
   label?: string;
@@ -162,46 +265,53 @@ export async function processOidcCallback(
   transaction: OidcTransaction,
   browserState: string | undefined,
 ): Promise<OidcIdentity> {
-  if (!browserState || !constantTimeEqual(browserState, transaction.state)) {
-    throw new Error("OIDC state validation failed");
-  }
-  if (transaction.expiresAt <= Math.floor(Date.now() / 1000)) throw new Error("OIDC transaction expired");
-  if (transaction.provider.id !== provider.id || transaction.redirectUri !== provider.redirectUri) {
-    throw new Error("OIDC transaction does not match configured provider");
-  }
-  if (`${callbackUrl.origin}${callbackUrl.pathname}` !== provider.redirectUri) {
-    throw new Error("OIDC callback URI does not match the registered redirect URI");
-  }
-
-  const as = await authorizationServer(provider);
+  await atStage("auth_response", () => {
+    if (!browserState || !constantTimeEqual(browserState, transaction.state)) {
+      failOidc("auth_response", oauth.INVALID_REQUEST);
+    }
+    if (transaction.expiresAt <= Math.floor(Date.now() / 1000)) failOidc("auth_response", oauth.INVALID_REQUEST);
+    if (transaction.provider.id !== provider.id || transaction.redirectUri !== provider.redirectUri) {
+      failOidc("auth_response", oauth.INVALID_REQUEST);
+    }
+    if (`${callbackUrl.origin}${callbackUrl.pathname}` !== provider.redirectUri) {
+      failOidc("auth_response", oauth.INVALID_REQUEST);
+    }
+  });
+  const as = await atStage("discovery", () => authorizationServer(provider));
   const client: oauth.Client = { client_id: provider.clientId };
-  const params = oauth.validateAuthResponse(as, client, callbackUrl, transaction.state);
-  const response = await oauth.authorizationCodeGrantRequest(
+  const params = await atStage("auth_response", () => oauth.validateAuthResponse(as, client, callbackUrl, transaction.state));
+  const response = await atStage("token_request", () => oauth.authorizationCodeGrantRequest(
     as,
     client,
-    oauth.ClientSecretBasic(provider.clientSecret),
+    clientSecretAuthentication(as, provider),
     params,
     provider.redirectUri,
     transaction.codeVerifier,
-  );
-  const result = await oauth.processAuthorizationCodeResponse(as, client, response, {
+  ));
+  const result = await atStage("token_response", () => oauth.processAuthorizationCodeResponse(as, client, response, {
     expectedNonce: transaction.nonce,
     requireIdToken: true,
+  }));
+  await atStage("signature", () => oauth.validateApplicationLevelSignature(as, response));
+  return atStage("claims", () => {
+    const claims = oauth.getValidatedIdTokenClaims(result);
+    if (!claims || claims.iss !== as.issuer) failOidc("claims", oauth.JWT_CLAIM_COMPARISON, "iss");
+    if (typeof claims.sub !== "string" || claims.sub.length < 1 || claims.sub.length > 512) {
+      failOidc("claims", oauth.INVALID_RESPONSE);
+    }
+    if (claims.email_verified !== true || typeof claims.email !== "string") failOidc("claims", oauth.INVALID_RESPONSE);
+    const email = claims.email.trim().toLowerCase();
+    if (email.length < 3 || email.length > 320 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      failOidc("claims", oauth.INVALID_RESPONSE);
+    }
+    const name = typeof claims.name === "string" ? claims.name.trim() : "";
+    return {
+      issuer: as.issuer,
+      subject: claims.sub,
+      email,
+      displayName: name.slice(0, 160) || email,
+    };
   });
-  await oauth.validateApplicationLevelSignature(as, response);
-  const claims = oauth.getValidatedIdTokenClaims(result);
-  if (!claims || claims.iss !== as.issuer) throw new Error("OIDC issuer validation failed");
-  if (typeof claims.sub !== "string" || claims.sub.length < 1 || claims.sub.length > 512) throw new Error("OIDC subject is invalid");
-  if (claims.email_verified !== true || typeof claims.email !== "string") throw new Error("A verified email claim is required");
-  const email = claims.email.trim().toLowerCase();
-  if (email.length < 3 || email.length > 320 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("OIDC email is invalid");
-  const name = typeof claims.name === "string" ? claims.name.trim() : "";
-  return {
-    issuer: as.issuer,
-    subject: claims.sub,
-    email,
-    displayName: name.slice(0, 160) || email,
-  };
 }
 
 export function safeReturnTo(value: string | null): string {
