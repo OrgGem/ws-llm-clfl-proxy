@@ -307,6 +307,7 @@ export function splitUtf8(text: string, maxBytes: number): string[] {
 }
 
 export class GatewaySession {
+  private readonly providerSessionId = crypto.randomUUID();
   private readonly active = new Map<string, ActiveRequest>();
   private readonly requestIds = new Set<string>();
   private closed = false;
@@ -715,6 +716,7 @@ export class GatewaySession {
         providerPayload,
         task.controller.signal,
         api,
+        this.providerSessionId,
       );
 
       task.upstreamStarted = true;

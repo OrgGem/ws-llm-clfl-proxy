@@ -3,6 +3,22 @@ import { buildProviderPayload, CompletionAccumulator, ProviderStreamConverter } 
 import { SseParser } from "./sse.js";
 
 describe("incremental SSE and provider conversion", () => {
+  it("accepts an omitted finish_reason on nonterminal chunks but still requires a terminal and DONE", () => {
+    const converter = new ProviderStreamConverter("openai");
+    expect(converter.consume({ data: JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "OK" } }] }) })[0]?.delta.content).toBe("OK");
+    expect(converter.completed).toBe(false);
+    converter.consume({ data: JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) });
+    expect(converter.completed).toBe(false);
+    converter.consume({ data: "[DONE]" });
+    expect(converter.completed).toBe(true);
+  });
+
+  it("preserves explicit Chat reasoning effort without adding a global default", () => {
+    const messages = [{ role: "user", content: "test" }];
+    expect(buildProviderPayload("openai", { model: "model", messages, reasoning_effort: "max" })).toMatchObject({ reasoning_effort: "max" });
+    expect(buildProviderPayload("openai", { model: "model", messages })).not.toHaveProperty("reasoning_effort");
+  });
+
   it("parses Anthropic tool events split at arbitrary chunk boundaries", () => {
     const parser = new SseParser();
     const converter = new ProviderStreamConverter("anthropic");

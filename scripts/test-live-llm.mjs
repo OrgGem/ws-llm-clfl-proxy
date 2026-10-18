@@ -8,6 +8,10 @@ async function main() {
 // Config contains secrets/envelopes; output intentionally excludes prompts and responses.
 const configPath = process.env.WS_PROXY_LIVE_CONFIG;
 const model = process.env.WS_PROXY_LIVE_MODEL;
+const reasoningEffort = process.env.WS_PROXY_LIVE_REASONING_EFFORT;
+if (reasoningEffort !== undefined && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(reasoningEffort)) throw new Error('Unsupported reasoning effort');
+const maxTokens = reasoningEffort ? 4096 : 512;
+const toolOnly = process.env.WS_PROXY_LIVE_TEST === 'tool';
 if (!configPath || !model) throw new Error('Set WS_PROXY_LIVE_CONFIG and WS_PROXY_LIVE_MODEL');
 const configStore = new ConfigStore(configPath);
 const config = await configStore.load();
@@ -21,7 +25,7 @@ function usageCounters(value) {
 }
 async function send(body) {
   const response = await fetch(`http://127.0.0.1:${adapter.port}/v1/chat/completions`, {
-    method: 'POST', headers, body: JSON.stringify({ model, max_tokens: 512, ...body }), signal: AbortSignal.timeout(120_000),
+    method: 'POST', headers, body: JSON.stringify({ model, max_tokens: maxTokens, ...(reasoningEffort ? {reasoning_effort: reasoningEffort} : {}), ...body }), signal: AbortSignal.timeout(120_000),
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -55,6 +59,7 @@ async function readStream(response) {
 }
 try {
   let started = performance.now();
+  if (!toolOnly) {
   const json = await (await send({ messages: [{ role: 'user', content: 'Reply with exactly the word OK.' }], stream: false })).json();
   assert.equal(json.object, 'chat.completion');
   assert.equal(json.model, model);
@@ -72,11 +77,12 @@ try {
   assert(Number.isSafeInteger(usage?.total_tokens), 'Streaming provider usage is required');
   results.push({ test: current, success: true, wallMs: Math.round(performance.now() - started), chunks: events.length, usage: usageCounters(usage) });
 
+  }
   current = 'chat-tool-stream'; started = performance.now();
   const toolEvents = await readStream(await send({
     messages: [{ role: 'user', content: 'Call echo with the value OK. Do not answer in text.' }], stream: true, stream_options: { include_usage: true },
     tools: [{ type: 'function', function: { name: 'echo', description: 'Return a provided string.', parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false } } }],
-    tool_choice: { type: 'function', function: { name: 'echo' } },
+    tool_choice: 'auto',
   }));
   const toolChoices = toolEvents.flatMap((event) => event.choices ?? []);
   const deltas = toolChoices.flatMap((choice) => choice.delta?.tool_calls ?? []);

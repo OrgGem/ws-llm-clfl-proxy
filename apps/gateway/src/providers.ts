@@ -137,6 +137,7 @@ export function buildProviderRequest(
   payload: Record<string, unknown>,
   signal: AbortSignal,
   api: ProviderRequestApi = "chat.completions",
+  providerSessionId?: string,
 ): ProviderRequest {
   if (!validateUpstreamModel(upstreamModel)) {
     throw new TypeError("Authorized upstream model is invalid");
@@ -168,6 +169,14 @@ export function buildProviderRequest(
     "content-type": "application/json",
     accept: "text/event-stream",
   });
+  if (url.origin === "https://opencode.ai" && url.pathname.startsWith("/inference/go/")) {
+    if (!providerSessionId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(providerSessionId)) {
+      throw new TypeError("A valid provider session ID is required for OpenCode Go");
+    }
+    headers.set("user-agent", "ws-llm-cloudflare-proxy/0.1.0");
+    headers.set("x-opencode-session", providerSessionId);
+    headers.set("accept", "application/json");
+  }
   if (protocol === "openai") {
     headers.set("authorization", `Bearer ${apiKey}`);
   } else {

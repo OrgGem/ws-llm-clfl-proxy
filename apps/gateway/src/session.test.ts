@@ -1054,6 +1054,25 @@ describe("GatewaySession", () => {
 });
 
 describe("Gateway boundaries", () => {
+  it("adds honest Go identity and an opaque session only to the exact Go endpoint", () => {
+    const sessionId = crypto.randomUUID();
+    const payload = { messages: [{ role: "user", content: "test" }], reasoning_effort: "max" };
+    for (const api of ["chat.completions", "responses", "completions"] as const) {
+      const suffix = api === "chat.completions" ? "chat/completions" : api;
+      const request = buildProviderRequest("openai", `https://opencode.ai/inference/go/openai/v1/${suffix}`, "test", "deepseek-v4.1-flash", payload, new AbortController().signal, api, sessionId);
+      const headers = new Headers(request.init.headers);
+      expect(headers.get("user-agent")).toBe("ws-llm-cloudflare-proxy/0.1.0");
+      expect(headers.get("x-opencode-session")).toBe(sessionId);
+      expect(headers.get("accept")).toBe("application/json");
+      if (api === "chat.completions") expect(JSON.parse(String(request.init.body)).reasoning_effort).toBe("max");
+    }
+    for (const endpoint of ["https://opencode.ai/inference/openai/v1/chat/completions", "https://opencode.ai.example/inference/go/openai/v1/chat/completions"]) {
+      const request = buildProviderRequest("openai", endpoint, "test", "model", payload, new AbortController().signal, "chat.completions", sessionId);
+      expect(new Headers(request.init.headers).get("x-opencode-session")).toBeNull();
+      expect(new Headers(request.init.headers).get("user-agent")).toBeNull();
+    }
+    expect(() => buildProviderRequest("openai", "https://opencode.ai/inference/go/openai/v1/chat/completions", "test", "model", payload, new AbortController().signal, "chat.completions", "bad\r\nheader")).toThrow();
+  });
   it("splits UTF-8 without breaking code points and caps emitted chunks at 16 KiB", () => {
     const value = "🙂漢字é".repeat(10_000);
     const parts = splitUtf8(value, 16_384);

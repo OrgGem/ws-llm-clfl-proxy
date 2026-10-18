@@ -207,7 +207,7 @@ export class ProviderStreamConverter {
       const index = rawChoice.index as number;
       if (index < 0 || index >= this.expectedChoices || indexesInEvent.has(index) || this.finishReasons.has(index)) invalidProviderStream();
       indexesInEvent.add(index);
-      if (rawChoice.finish_reason !== null && (typeof rawChoice.finish_reason !== "string" || rawChoice.finish_reason.length === 0)) {
+      if (rawChoice.finish_reason !== undefined && rawChoice.finish_reason !== null && (typeof rawChoice.finish_reason !== "string" || rawChoice.finish_reason.length === 0)) {
         invalidProviderStream();
       }
       if (!isRecord(rawChoice.delta)) invalidProviderStream();
@@ -282,7 +282,7 @@ export class ProviderStreamConverter {
           ...(argumentsPart === undefined ? {} : { arguments: argumentsPart }),
         };
       }
-      const finishReason = rawChoice.finish_reason as string | null;
+      const finishReason = (rawChoice.finish_reason ?? null) as string | null;
       if (finishReason !== null) this.finishReasons.set(index, finishReason);
       const rawLogprobs = rawChoice.logprobs;
       if (rawLogprobs !== undefined && rawLogprobs !== null && !isRecord(rawLogprobs)) invalidProviderStream();
