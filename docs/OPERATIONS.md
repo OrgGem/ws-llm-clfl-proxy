@@ -116,3 +116,15 @@ The endpoint must be a public HTTPS DNS hostname on port 443, with no embedded c
 After registering, add the provider API key through the existing envelope form, create model aliases and enable them for the project, then grant the required provider/model pairs to clients. The endpoint will receive that API key and submitted model inputs. Base URL and protocol are immutable: to move to another endpoint create a new provider ID and enroll a key again, then disable the old provider. Neither a client nor a socket message may supply an upstream URL.
 
 Custom registration uses the OpenAI protocol; native Chat Completions, Responses and legacy Completions generation are available with adapter 0.3.0 when the provider implements those upstream APIs. They are separate from OpenAI subscription OAuth. Responses is stateless, with storage/background and remote context handles disabled; see ADR 0003. The local adapter model configuration keeps the custom registry ID as `provider` and adds `protocol: "openai"`; bootstrap exports include the protocol. Re-import the updated bootstrap and use the updated adapter package. Legacy built-in OpenAI/Anthropic adapter models remain compatible without a protocol field.
+
+## Authorized live generation check
+
+After building the adapter, use an existing private adapter config and permitted alias:
+
+```sh
+WS_PROXY_LIVE_CONFIG=/secure/path/adapter.json \
+WS_PROXY_LIVE_MODEL=your-model-alias \
+node scripts/test-live-llm.mjs
+```
+
+Run only with the owner's authorization: the script can send three real provider requests (JSON, streaming text and streaming tool call), and stops on the first failure. It prints fixed outcomes, status codes and numeric token counters, not prompts, generated content or credentials. Upstream HTTP 402/403 indicates provider rejection; verify account/plan/key permissions instead of retrying or assuming Gateway failure. Custom provider `/models` discovery may be a different URL from its generation Base URL; OpenCode Console publishes the live list at `https://opencode.ai/inference/v1/models`.
