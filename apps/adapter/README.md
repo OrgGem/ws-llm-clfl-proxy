@@ -43,7 +43,7 @@ node apps/adapter/dist/bin.js model add --id my-chat --provider openai --credent
 node apps/adapter/dist/bin.js model list
 ```
 
-System administrators can register a custom public HTTPS provider in Identity's Providers screen. Its provider ID and endpoint are immutable; register another ID to use a different endpoint. Custom routes use the OpenAI chat-completions protocol, and their API keys use the same encrypted credential form. After registration, add an alias with the provider ID and explicit protocol:
+System administrators can register a custom public HTTPS provider in Identity's Providers screen. Its ID and protocol remain fixed. An administrator can edit the custom Base URL: same-origin path changes keep existing envelopes, while cross-origin changes revoke all provider credentials and require key enrollment again (ADR 0004). The adapter reads routing through Gateway; no local Base URL change is needed. Custom routes use the OpenAI chat-completions protocol, and their API keys use the same encrypted credential form. After registration, add an alias with the provider ID and explicit protocol:
 
 ```sh
 node apps/adapter/dist/bin.js model add --id vendor-chat --provider my_provider --protocol openai --credential-id CREDENTIAL_ID

@@ -165,7 +165,7 @@ The adapter's OpenAI-compatible HTTP API is a separate local boundary. Bind only
 
 ## Custom provider configuration
 
-An administrator can register an immutable public HTTPS API root using the OpenAI-compatible protocol. The provider ID remains the credential and authorization identity; `protocol` selects payload and SSE translation independently. Bootstrap model entries include `protocol`; adapter 0.2.0 requires it for custom provider IDs, while legacy built-in entries can infer their protocol. The Base URL stays in the server registry and is never accepted in request frames. Custom DNS is validated during registration, re-enabling, connection tests and before Gateway decryption; redirects are rejected. DNS validation does not pin the later upstream connection.
+An administrator can register a public HTTPS API root using the OpenAI-compatible protocol and update custom routes under ADR 0004. Same-origin path updates retain envelopes; cross-origin updates atomically revoke provider credentials. ID and protocol remain fixed. The provider ID remains the credential and authorization identity; `protocol` selects payload and SSE translation independently. Bootstrap model entries include `protocol`; adapter 0.2.0 requires it for custom provider IDs, while legacy built-in entries can infer their protocol. The Base URL stays in the server registry and is never accepted in request frames. Custom DNS is validated during registration, re-enabling, connection tests and before Gateway decryption; redirects are rejected. DNS validation does not pin the later upstream connection.
 
 ## Generation operation selection (ADR 0003)
 

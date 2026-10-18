@@ -17,7 +17,11 @@ const providers = [
 ];
 const registrations = [];
 const providerUpdates = [];
+const credentialRequests = [];
 const serverErrors = [];
+let sessionIsAdmin = true;
+let simulateCredentialConflict = true;
+let simulateProviderUpdateConflict = false;
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
@@ -29,7 +33,7 @@ const server = http.createServer(async (req, res) => {
         value = {
           authenticated: true,
           csrfToken,
-          user: { id: "usr_ui_admin", email: "admin@example.test", displayName: "UI Admin", isAdmin: true },
+          user: { id: "usr_ui_admin", email: "admin@example.test", displayName: "UI Admin", isAdmin: sessionIsAdmin },
           projects: [{ id: projectId, name: "UI test project", role: "owner" }],
           activeProjectId: projectId,
           session: { id: "web_ui_admin", kind: "web", expiresAt: Math.floor(Date.now() / 1000) + 3_600 },
@@ -63,20 +67,53 @@ const server = http.createServer(async (req, res) => {
           providers.push(provider);
           value = { provider };
         }
+      } else if (url.pathname === "/api/credentials" && req.method === "POST") {
+        assert.equal(req.headers["x-csrf-token"], csrfToken, "credential enrollment must include the session CSRF token");
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        credentialRequests.push(body);
+        if (simulateCredentialConflict) {
+          simulateCredentialConflict = false;
+          const custom = providers.find((provider) => provider.id === "my_provider");
+          custom.baseUrl = "https://credential-raced.example.net/v1/";
+          status = 409;
+          value = { error: "provider_conflict" };
+        } else {
+          value = { credential: { id: "cred_ui_test" } };
+        }
       } else if (/^\/api\/providers\/[a-z][a-z0-9_-]{0,31}$/.test(url.pathname) && req.method === "PUT") {
-        assert.equal(req.headers["x-csrf-token"], csrfToken, "provider enable/disable must include the session CSRF token");
+        assert.equal(req.headers["x-csrf-token"], csrfToken, "provider updates must include the session CSRF token");
         const chunks = [];
         for await (const chunk of req) chunks.push(chunk);
         const body = JSON.parse(Buffer.concat(chunks).toString());
         const id = decodeURIComponent(url.pathname.split("/").at(-1));
         providerUpdates.push({ id, body });
         const provider = providers.find((item) => item.id === id);
-        if (!provider || Object.keys(body).length !== 1 || typeof body.enabled !== "boolean") {
+        if (!provider) {
           status = 400;
           value = { error: "invalid_request" };
-        } else {
+        } else if (Object.keys(body).sort().join(",") === "baseUrl,expectedBaseUrl" && provider.custom === true) {
+          if (simulateProviderUpdateConflict) {
+            simulateProviderUpdateConflict = false;
+            provider.baseUrl = "https://concurrent-provider.example.net/v1/";
+            status = 409;
+            value = { error: "provider_conflict" };
+          } else if (body.expectedBaseUrl !== provider.baseUrl) {
+            status = 409;
+            value = { error: "provider_conflict" };
+          } else {
+            const oldOrigin = new URL(provider.baseUrl).origin;
+            const newOrigin = new URL(body.baseUrl).origin;
+            provider.baseUrl = body.baseUrl;
+            value = { provider, revokedCredentialCount: oldOrigin === newOrigin ? 0 : 4 };
+          }
+        } else if (Object.keys(body).length === 1 && typeof body.enabled === "boolean") {
           provider.enabled = body.enabled;
           value = { provider };
+        } else {
+          status = 400;
+          value = { error: "invalid_request" };
         }
       } else {
         status = 404;
@@ -141,8 +178,8 @@ async function evaluate(expression) {
   return response.result.value;
 }
 
-function setField(label, value) {
-  return `(() => { const group=[...document.querySelectorAll('.field')].find(x=>x.querySelector('label')?.textContent.trim()===${JSON.stringify(label)}); if(!group) throw Error('Missing field: '+${JSON.stringify(label)}); const input=group.querySelector('input'); input.value=${JSON.stringify(value)}; input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); })()`;
+function setField(label, value, root = "document") {
+  return `(() => { const group=[...${root}.querySelectorAll('.field')].find(x=>x.querySelector('label')?.textContent.trim()===${JSON.stringify(label)}); if(!group) throw Error('Missing field: '+${JSON.stringify(label)}); const input=group.querySelector('input'); input.value=${JSON.stringify(value)}; input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); })()`;
 }
 
 try {
@@ -187,7 +224,7 @@ try {
   assert.equal(await evaluate("[...document.querySelectorAll('select')].filter(select=>[...select.options].some(option=>option.value==='my_provider')).length"), 2, "custom provider should appear in the API-key and model-mapping selectors");
   assert.equal(await evaluate("document.querySelector('.content').innerText.includes('https://provider.example.org/v1/')"), true, "registered base URL should be visible in the provider card");
 
-  await evaluate("window.confirm=()=>true");
+  await evaluate("window.__confirmMessages=[];window.confirm=(message)=>{window.__confirmMessages.push(message);return true}");
   await evaluate("[...document.querySelectorAll('.panel')].find(panel=>panel.querySelector('h2')?.textContent==='My Provider').querySelector('button').click()");
   await until(() => evaluate("document.querySelector('.content').innerText.includes('Enable provider')"));
   assert.deepEqual(providerUpdates[0], { id: "my_provider", body: { enabled: false } });
@@ -197,6 +234,71 @@ try {
   await until(() => evaluate("[...document.querySelectorAll('select')].filter(select=>[...select.options].some(option=>option.value==='my_provider')).length===2"));
   assert.deepEqual(providerUpdates[1], { id: "my_provider", body: { enabled: true } });
 
+  const providerCard = "[...document.querySelectorAll('.panel')].find(panel=>panel.querySelector('h2')?.textContent==='My Provider')";
+  assert.equal(await evaluate(`${providerCard}.querySelector('button[aria-expanded]')?.textContent`), "Edit Base URL", "custom provider editor should be available to system admins");
+  assert.equal(await evaluate("[...document.querySelectorAll('.panel')].find(panel=>panel.querySelector('h2')?.textContent==='OpenAI')?.innerText.includes('Edit Base URL') ?? false"), false, "built-in endpoint should not be editable");
+
+  const updateCountBeforeCancel = providerUpdates.length;
+  await evaluate(`${providerCard}.querySelector('button[aria-expanded]').click()`);
+  await until(() => evaluate(`${providerCard}.querySelector('.provider-base-url-editor input')?.value==='https://provider.example.org/v1/'`));
+  assert.equal(await evaluate(`${providerCard}.querySelector('.provider-base-url-editor button[type=submit]').disabled || ${providerCard}.querySelector('.provider-base-url-editor button[type=button]').disabled`), false, "save and cancel controls should be enabled while idle");
+  await evaluate(`${providerCard}.querySelector('.provider-base-url-editor button[type=button]').click()`);
+  assert.equal(providerUpdates.length, updateCountBeforeCancel, "cancel should not send an endpoint update");
+
+  await evaluate(`${providerCard}.querySelector('button[aria-expanded]').click()`);
+  await evaluate(setField("Base URL", "https://provider.example.org/v1/compatible/", `${providerCard}.querySelector('.provider-base-url-editor')`));
+  await evaluate(`${providerCard}.querySelector('.provider-base-url-editor button[type=submit]').click()`);
+  await until(() => evaluate("document.querySelector('.content').innerText.includes('https://provider.example.org/v1/compatible/')"));
+  assert.deepEqual(providerUpdates[2], {
+    id: "my_provider",
+    body: { baseUrl: "https://provider.example.org/v1/compatible/", expectedBaseUrl: "https://provider.example.org/v1/" },
+  });
+  const sameOriginConfirmation = await evaluate("window.__confirmMessages.at(-1)");
+  assert.match(sameOriginConfirmation, /origin is unchanged.*credential envelopes will be retained/i, "same-origin update confirmation must explain credential retention");
+  assert.ok(sameOriginConfirmation.includes("https://provider.example.org/v1/") && sameOriginConfirmation.includes("https://provider.example.org/v1/compatible/"), "same-origin confirmation should show both URLs");
+  assert.equal(await evaluate("document.querySelector('#live-message').textContent.includes('credential envelopes were retained')"), true);
+  assert.equal(await evaluate(`${providerCard}.querySelector('button[aria-expanded]').disabled`), false, "edit control should recover after save and refresh");
+
+  const oldSameOriginUrl = "https://provider.example.org/v1/compatible/";
+  await evaluate(`${providerCard}.querySelector('button[aria-expanded]').click()`);
+  await evaluate(setField("Base URL", "https://provider-new.example.net/v1/", `${providerCard}.querySelector('.provider-base-url-editor')`));
+  await evaluate(`${providerCard}.querySelector('.provider-base-url-editor button[type=submit]').click()`);
+  await until(() => evaluate("document.querySelector('.content').innerText.includes('https://provider-new.example.net/v1/')"));
+  assert.deepEqual(providerUpdates[3], {
+    id: "my_provider",
+    body: { baseUrl: "https://provider-new.example.net/v1/", expectedBaseUrl: oldSameOriginUrl },
+  });
+  const crossOriginConfirmation = await evaluate("window.__confirmMessages.at(-1)");
+  assert.match(crossOriginConfirmation, /revoke all saved credentials.*globally.*enroll provider keys again/i, "cross-origin confirmation must explain global credential revocation");
+  assert.ok(crossOriginConfirmation.includes(oldSameOriginUrl) && crossOriginConfirmation.includes("https://provider-new.example.net/v1/"), "cross-origin confirmation should show both URLs");
+  assert.equal(await evaluate("document.querySelector('#live-message').textContent.includes('4 saved provider credentials were revoked')"), true);
+
+  simulateProviderUpdateConflict = true;
+  await evaluate(`${providerCard}.querySelector('button[aria-expanded]').click()`);
+  await evaluate(setField("Base URL", "https://stale-update.example.org/v1/", `${providerCard}.querySelector('.provider-base-url-editor')`));
+  const providerUpdateCountBeforeConflict = providerUpdates.length;
+  await evaluate(`${providerCard}.querySelector('.provider-base-url-editor button[type=submit]').click()`);
+  await until(() => evaluate("document.querySelector('#live-message').textContent.includes('review the current URL and retry')"));
+  assert.equal(providerUpdates.length, providerUpdateCountBeforeConflict + 1, "a stale provider update should not be silently resubmitted");
+  assert.equal(await evaluate("document.querySelector('.content').innerText.includes('https://concurrent-provider.example.net/v1/')"), true, "409 should refresh the provider card with the latest URL");
+
+  const keyProviderExpression = "[...document.querySelectorAll('.field')].find(group=>group.querySelector('label')?.textContent.trim()==='LLM provider').querySelector('select')";
+  await evaluate(`(() => {const select=${keyProviderExpression};select.value='my_provider';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+  assert.equal(await evaluate("document.querySelector('[aria-live=polite].field-help')?.textContent.includes('https://concurrent-provider.example.net/v1/')"), true, "key form should identify the selected provider endpoint");
+  await evaluate(setField("Provider API key", "mock-provider-key-not-a-real-secret"));
+  await evaluate("[...document.querySelectorAll('button[type=submit]')].find(button=>button.textContent==='Encrypt and save').click()");
+  await until(() => evaluate("document.querySelector('#live-message').textContent.includes('key field cleared')"));
+  assert.equal(credentialRequests[0].expectedBaseUrl, "https://concurrent-provider.example.net/v1/", "custom credential enrollment must bind to the selected canonical Base URL");
+  assert.equal(await evaluate("[...document.querySelectorAll('.field')].find(group=>group.querySelector('label')?.textContent.trim()==='Provider API key').querySelector('input').value"), "", "a stale endpoint conflict must clear the raw key field");
+  assert.equal(await evaluate(`${keyProviderExpression}.value`), "", "credential conflict must require the user to select the provider again");
+
+  await evaluate(`(() => {const select=${keyProviderExpression};select.value='my_provider';select.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+  assert.equal(await evaluate("document.querySelector('[aria-live=polite].field-help')?.textContent.includes('https://credential-raced.example.net/v1/')"), true, "credential conflict should refresh the endpoint for deliberate retry");
+  await evaluate(setField("Provider API key", "mock-provider-key-after-reentry"));
+  await evaluate("[...document.querySelectorAll('button[type=submit]')].find(button=>button.textContent==='Encrypt and save').click()");
+  await until(() => evaluate("document.querySelector('#live-message').textContent.includes('Provider key encrypted')"));
+  assert.equal(credentialRequests[1].expectedBaseUrl, "https://credential-raced.example.net/v1/", "retry must submit the refreshed endpoint after the user re-enters the key");
+
   await evaluate(setField("Provider ID", "private_test"));
   await evaluate(setField("Display name", "Private Test"));
   await evaluate(setField("Base URL", "https://127.0.0.1/v1/"));
@@ -205,9 +307,17 @@ try {
   assert.equal(registrations.length, 2, "private URL should be sent only to the mock API for its rejection response");
   assert.equal(await evaluate("[...document.querySelectorAll('button[type=submit]')].find(button=>button.textContent==='Register provider').disabled"), false, "register button should recover after an endpoint error");
   assert.equal(await evaluate("document.querySelector('.content').innerText.includes('private_test')"), false, "rejected provider should not appear in the provider list");
+
+  sessionIsAdmin = false;
+  await command("Page.navigate", { url: `http://127.0.0.1:${address.port}/ui` });
+  await until(() => evaluate("document.querySelector('#app')?.getAttribute('aria-busy')==='false'"));
+  await evaluate("[...document.querySelectorAll('.nav-item')].find(button=>button.textContent.includes('Providers')).click()");
+  await until(() => evaluate("[...document.querySelectorAll('.panel')].some(panel=>panel.querySelector('h2')?.textContent==='My Provider')"));
+  assert.equal(await evaluate("document.querySelector('.content').innerText.includes('Edit Base URL')"), false, "non-admins must not see endpoint editing controls");
+  assert.equal(await evaluate("[...document.querySelectorAll('h2')].some(node=>node.textContent==='Add a custom provider')"), false, "non-admins must not see custom provider registration");
   assert.deepEqual(serverErrors, []);
   assert.deepEqual(browserExceptions, []);
-  console.log("Chromium custom-provider UI passed: admin registration, enable/disable refresh, provider dropdowns, URL display, and private-endpoint error recovery.");
+  console.log("Chromium custom-provider UI passed: admin registration, same-origin URL reuse, cross-origin revocation, key enrollment CAS, role restrictions, provider dropdowns, and endpoint error recovery.");
 } catch (error) {
   console.error({ browserExceptions, serverErrors, page: ws?.readyState === WebSocket.OPEN ? await evaluate("document.body.innerText") : "unavailable" });
   throw error;

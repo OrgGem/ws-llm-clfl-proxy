@@ -1,6 +1,6 @@
 import { decryptCredentialEnvelope, CredentialEnvelopeSchema } from "@ws-proxy/shared";
 import { insertAudit, rateLimit } from "./db.js";
-import { forbidden, json, type WebActor } from "./http.js";
+import { forbidden, getWebActor, json, type WebActor } from "./http.js";
 import { decodeBase64Url, newId, parseEnvelopeKeys, readJson } from "./security.js";
 import { assertProviderBaseUrlPublic, isCanonicalBuiltinProvider, isCustomProviderId, normalizeProviderBaseUrl } from "./provider-registry.js";
 
@@ -188,6 +188,26 @@ export async function handleManagementApi(request: Request, env: Env, actor: Web
     } catch {
       return json({ error: "provider_connection_failed" }, 502);
     }
+
+    const checkAt = Math.floor(Date.now() / 1000);
+    const [liveActor, liveCredential, liveProvider] = await Promise.all([
+      getWebActor(request, env),
+      env.DB.prepare(
+        "SELECT id,user_id,project_id,provider,key_version,expires_at FROM credentials WHERE id=? AND revoked_at IS NULL AND expires_at>?",
+      ).bind(metadata.id, checkAt).first<{ id: string; user_id: string; project_id: string; provider: string; key_version: string; expires_at: number }>(),
+      env.DB.prepare(
+        "SELECT enabled,protocol,base_url AS baseUrl,custom FROM providers WHERE provider=?",
+      ).bind(metadata.provider).first<{ enabled: number; protocol: "openai" | "anthropic"; baseUrl: string; custom: number }>(),
+    ]);
+    if (!liveActor || liveActor.userId !== actor.userId || liveActor.sessionId !== actor.sessionId ||
+        !liveCredential || liveCredential.user_id !== metadata.user_id || liveCredential.project_id !== metadata.project_id ||
+        liveCredential.provider !== metadata.provider || liveCredential.key_version !== metadata.key_version || liveCredential.expires_at !== metadata.expires_at ||
+        !canManage(await role(env, metadata.project_id, actor.userId))) return forbidden();
+    if (!liveProvider || liveProvider.enabled !== provider.enabled || liveProvider.protocol !== provider.protocol ||
+        liveProvider.baseUrl !== provider.baseUrl || liveProvider.custom !== provider.custom) {
+      return json({ error: "credential_invalid" }, 409);
+    }
+
     let plaintext: Uint8Array | undefined;
     let keyBytes: Uint8Array | undefined;
     try {
@@ -202,7 +222,7 @@ export async function handleManagementApi(request: Request, env: Env, actor: Web
       const response = await fetch(endpoint, {
         method: "GET",
         headers: provider.protocol === "openai" ? { authorization: `Bearer ${apiKey}` } : { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-        redirect: "error",
+        redirect: "manual",
         signal: AbortSignal.timeout(10_000),
       });
       await response.body?.cancel();

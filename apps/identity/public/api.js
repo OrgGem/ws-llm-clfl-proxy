@@ -1,10 +1,11 @@
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 export class ApiError extends Error {
-  constructor(status, message = `Request failed (${status})`) {
+  constructor(status, message = `Request failed (${status})`, code) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -61,7 +62,10 @@ export function createApiClient({
       payload = undefined;
     }
     if (!response.ok) {
-      throw new ApiError(response.status, safeErrorMessage(response.status, payload, target.pathname));
+      const code = payload && typeof payload === "object" && payload.error === "provider_conflict"
+        ? "provider_conflict"
+        : undefined;
+      throw new ApiError(response.status, safeErrorMessage(response.status, payload, target.pathname), code);
     }
     return payload;
   }
@@ -103,8 +107,14 @@ function safeErrorMessage(status, payload, pathname) {
   if (providerRegistryPath && status === 400 && code === "endpoint_not_allowed") {
     return "Provider URL must use public HTTPS and resolve only to public addresses. Private, local, or insecure endpoints are blocked.";
   }
+  if (providerRegistryPath && status === 409 && code === "provider_conflict") {
+    return "This provider URL changed in another administrator session. The provider list has been refreshed; review the current URL and try again.";
+  }
+  if (pathname === "/api/credentials" && status === 409 && code === "provider_conflict") {
+    return "The provider URL changed while you were adding this key. The provider list was refreshed; review the current endpoint and enter the key again.";
+  }
   if (pathname === "/api/providers" && status === 409 && code === "provider_exists") {
-    return "That provider ID is already registered. Provider IDs and endpoints are immutable; choose a new ID.";
+    return "That provider ID is already registered. Choose a different provider ID.";
   }
   if (pathname === "/api/providers" && status === 400 && code === "invalid_request") {
     return "Provider details are invalid. Check the provider ID, name, URL, and OpenAI-compatible protocol.";

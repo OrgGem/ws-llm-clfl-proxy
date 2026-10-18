@@ -299,24 +299,127 @@ export async function handleBrowserApi(request: Request, env: Env): Promise<Resp
   if (providerMatch && method === "PUT") {
     if (!actor.isAdmin) return forbidden();
     if (!(await rateLimit(env.DB, "provider_registry_update", actor.userId, 10, 60))) return json({ error: "rate_limited" }, 429);
-    const body = await readJson(request, 2_048);
-    if (Object.keys(body).length !== 1 || typeof body.enabled !== "boolean") return json({ error: "invalid_request" }, 400);
+    const body = await readJson(request, 8_192);
+    const fields = Object.keys(body);
+    const enabledUpdate = fields.length === 1 && fields[0] === "enabled" && typeof body.enabled === "boolean";
+    const baseUrlUpdate = fields.length === 2 && fields.includes("baseUrl") && fields.includes("expectedBaseUrl") &&
+      typeof body.baseUrl === "string" && typeof body.expectedBaseUrl === "string" &&
+      body.baseUrl.length > 0 && body.baseUrl.length <= 2_048 && body.baseUrl.trim() === body.baseUrl &&
+      body.expectedBaseUrl.length > 0 && body.expectedBaseUrl.length <= 2_048 && body.expectedBaseUrl.trim() === body.expectedBaseUrl;
+    if (!enabledUpdate && !baseUrlUpdate) return json({ error: "invalid_request" }, 400);
     const existingProvider = await env.DB.prepare(
-      "SELECT enabled,protocol,base_url AS baseUrl,custom FROM providers WHERE provider=?",
-    ).bind(providerMatch[1]!).first<{ enabled: number; protocol: "openai" | "anthropic"; baseUrl: string; custom: number }>();
+      "SELECT enabled,protocol,base_url AS baseUrl,custom,display_name AS displayName FROM providers WHERE provider=?",
+    ).bind(providerMatch[1]!).first<{ enabled: number; protocol: "openai" | "anthropic"; baseUrl: string; custom: number; displayName: string }>();
     if (!existingProvider) return json({ error: "not_found" }, 404);
     if ((existingProvider.protocol !== "openai" && existingProvider.protocol !== "anthropic") ||
         !(isCanonicalBuiltinProvider(providerMatch[1]!, existingProvider.protocol, existingProvider.baseUrl, existingProvider.custom) ||
           isCustomProviderId(providerMatch[1]!, existingProvider.custom))) return forbidden();
-    if (body.enabled && existingProvider.custom === 1) {
+
+    if (baseUrlUpdate) {
+      if (!isCustomProviderId(providerMatch[1]!, existingProvider.custom)) return forbidden();
+      let expectedBaseUrl: string;
+      try {
+        expectedBaseUrl = normalizeProviderBaseUrl(env, body.expectedBaseUrl as string);
+      } catch {
+        return json({ error: "invalid_request" }, 400);
+      }
+      if (expectedBaseUrl !== existingProvider.baseUrl) return json({ error: "provider_conflict" }, 409);
+
+      let nextBaseUrl: string;
+      try {
+        nextBaseUrl = normalizeProviderBaseUrl(env, body.baseUrl as string);
+      } catch (error) {
+        return json({ error: "endpoint_not_allowed", ...(error instanceof ProviderEndpointSecurityError ? { reason: error.code, stage: error.stage } : {}) }, 400);
+      }
+
+      const currentProvider = {
+        id: providerMatch[1]!,
+        displayName: existingProvider.displayName,
+        baseUrl: existingProvider.baseUrl,
+        protocol: existingProvider.protocol,
+        custom: true,
+        enabled: existingProvider.enabled === 1,
+      };
+      if (nextBaseUrl === expectedBaseUrl) {
+        const liveAdmin = await env.DB.prepare(
+          `SELECT 1 AS allowed FROM users u
+           JOIN user_allowlist a ON a.issuer=u.issuer AND a.subject=u.subject
+           JOIN sessions s ON s.user_id=u.id
+           WHERE u.id=? AND u.active=1 AND a.is_admin=1 AND a.revoked_at IS NULL
+             AND s.id=? AND s.kind='web' AND s.revoked_at IS NULL AND s.expires_at>?`,
+        ).bind(actor.userId, actor.sessionId, Math.floor(Date.now() / 1000)).first<{ allowed: number }>();
+        if (!liveAdmin) return forbidden();
+        const latest = await env.DB.prepare(
+          "SELECT display_name AS displayName,base_url AS baseUrl,enabled FROM providers WHERE provider=? AND custom=1 AND protocol=?",
+        ).bind(providerMatch[1]!, existingProvider.protocol).first<{ displayName: string; baseUrl: string; enabled: number }>();
+        if (!latest) return json({ error: "not_found" }, 404);
+        if (latest.baseUrl !== expectedBaseUrl) return json({ error: "provider_conflict" }, 409);
+        return json({ provider: { ...currentProvider, displayName: latest.displayName, baseUrl: latest.baseUrl, enabled: latest.enabled === 1 }, revokedCredentialCount: 0 });
+      }
+
+      try {
+        await assertProviderBaseUrlPublic(nextBaseUrl);
+      } catch (error) {
+        return json({ error: "endpoint_not_allowed", ...(error instanceof ProviderEndpointSecurityError ? { reason: error.code, stage: error.stage } : {}) }, 400);
+      }
+
+      const oldOrigin = new URL(expectedBaseUrl).origin;
+      const newOrigin = new URL(nextBaseUrl).origin;
+      const originChanged = oldOrigin !== newOrigin;
+      const now = Math.floor(Date.now() / 1000);
+      const statements = [
+        env.DB.prepare(
+          `UPDATE providers SET base_url=? WHERE provider=? AND custom=1 AND protocol=? AND base_url=? AND EXISTS (
+            SELECT 1 FROM users u
+            JOIN user_allowlist a ON a.issuer=u.issuer AND a.subject=u.subject
+            JOIN sessions s ON s.user_id=u.id
+            WHERE u.id=? AND u.active=1 AND a.is_admin=1 AND a.revoked_at IS NULL
+              AND s.id=? AND s.kind='web' AND s.revoked_at IS NULL AND s.expires_at>?
+          )`,
+        ).bind(nextBaseUrl, providerMatch[1]!, existingProvider.protocol, expectedBaseUrl, actor.userId, actor.sessionId, now),
+        env.DB.prepare(
+          `INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,details_json,created_at)
+           SELECT ?,?,'provider.base_url_updated','provider',?,json_object(
+             'oldBaseUrl',?,'newBaseUrl',?,'originChanged',json(?),
+             'revokedCredentialCount',CASE WHEN ?=1 THEN (SELECT COUNT(*) FROM credentials WHERE provider=? AND revoked_at IS NULL) ELSE 0 END
+           ),? WHERE changes()=1`,
+        ).bind(`aud_${crypto.randomUUID()}`, actor.userId, providerMatch[1]!, expectedBaseUrl, nextBaseUrl, originChanged ? "true" : "false", originChanged ? 1 : 0, providerMatch[1]!, now),
+      ];
+      if (originChanged) {
+        statements.push(env.DB.prepare(
+          "UPDATE credentials SET revoked_at=? WHERE provider=? AND revoked_at IS NULL AND changes()=1",
+        ).bind(now, providerMatch[1]!));
+      }
+      const results = await env.DB.batch(statements);
+      if (!results[0]?.meta.changes) {
+        const latest = await env.DB.prepare("SELECT base_url AS baseUrl FROM providers WHERE provider=?").bind(providerMatch[1]!).first<{ baseUrl: string }>();
+        if (!latest) return json({ error: "not_found" }, 404);
+        if (latest.baseUrl !== expectedBaseUrl) return json({ error: "provider_conflict" }, 409);
+        return forbidden();
+      }
+      return json({
+        provider: {
+          id: providerMatch[1]!,
+          displayName: existingProvider.displayName,
+          baseUrl: nextBaseUrl,
+          protocol: existingProvider.protocol,
+          custom: true,
+          enabled: existingProvider.enabled === 1,
+        },
+        revokedCredentialCount: originChanged ? (results[2]?.meta.changes ?? 0) : 0,
+      });
+    }
+
+    if (body.enabled === true && existingProvider.custom === 1) {
       try {
         const normalized = normalizeProviderBaseUrl(env, existingProvider.baseUrl);
         if (normalized !== existingProvider.baseUrl) return json({ error: "endpoint_not_allowed" }, 400);
         await assertProviderBaseUrlPublic(normalized);
-      } catch {
-        return json({ error: "endpoint_not_allowed" }, 400);
+      } catch (error) {
+        return json({ error: "endpoint_not_allowed", ...(error instanceof ProviderEndpointSecurityError ? { reason: error.code, stage: error.stage } : {}) }, 400);
       }
     }
+
     const now = Math.floor(Date.now() / 1000);
     const updated = await env.DB.prepare(
       `UPDATE providers SET enabled=? WHERE provider=? AND (
@@ -332,7 +435,7 @@ export async function handleBrowserApi(request: Request, env: Env): Promise<Resp
         WHERE u.id=? AND u.active=1 AND a.is_admin=1 AND a.revoked_at IS NULL
           AND s.id=? AND s.kind='web' AND s.revoked_at IS NULL AND s.expires_at>?
       ) RETURNING provider,display_name,enabled,protocol,base_url,custom`,
-    ).bind(body.enabled ? 1 : 0, providerMatch[1]!, existingProvider.protocol, existingProvider.baseUrl, existingProvider.custom, actor.userId, actor.sessionId, now)
+    ).bind(body.enabled === true ? 1 : 0, providerMatch[1]!, existingProvider.protocol, existingProvider.baseUrl, existingProvider.custom, actor.userId, actor.sessionId, now)
       .first<{ provider: string; display_name: string; enabled: number; protocol: "openai" | "anthropic"; base_url: string; custom: number }>();
     if (!updated) {
       const exists = await env.DB.prepare("SELECT 1 AS found FROM providers WHERE provider=?").bind(providerMatch[1]!).first<{ found: number }>();
@@ -356,8 +459,21 @@ export async function handleBrowserApi(request: Request, env: Env): Promise<Resp
     let apiKey = body.apiKey;
     if (!text(projectId, 128) || !safeId.test(projectId) || !text(provider, 32) || !providerId.test(provider) || typeof apiKey !== "string" || apiKey.length < 1 || new TextEncoder().encode(apiKey).byteLength > 8_192) return json({ error: "invalid_request" }, 400);
     if (!(await requireProjectWrite(env, actor, projectId))) return forbidden();
-    const activeProvider = await env.DB.prepare("SELECT provider FROM providers WHERE provider = ? AND enabled = 1").bind(provider).first<{ provider: string }>();
+    const activeProvider = await env.DB.prepare("SELECT provider,protocol,base_url AS baseUrl,custom FROM providers WHERE provider = ? AND enabled = 1")
+      .bind(provider).first<{ provider: string; protocol: string; baseUrl: string; custom: number }>();
     if (!activeProvider) return json({ error: "provider_disallowed" }, 400);
+    if (activeProvider.custom === 1) {
+      if (typeof body.expectedBaseUrl !== "string" || body.expectedBaseUrl.length < 1 || body.expectedBaseUrl.length > 2_048 || body.expectedBaseUrl.trim() !== body.expectedBaseUrl) {
+        return json({ error: "provider_conflict" }, 409);
+      }
+      let expectedBaseUrl: string;
+      try {
+        expectedBaseUrl = normalizeProviderBaseUrl(env, body.expectedBaseUrl);
+      } catch {
+        return json({ error: "provider_conflict" }, 409);
+      }
+      if (expectedBaseUrl !== activeProvider.baseUrl) return json({ error: "provider_conflict" }, 409);
+    }
     if (!(await rateLimit(env.DB, "credential_create", actor.userId, 20, 3600))) return json({ error: "rate_limited" }, 429);
     const credentialId = newId("cred");
     const now = Math.floor(Date.now() / 1000);
@@ -365,8 +481,15 @@ export async function handleBrowserApi(request: Request, env: Env): Promise<Resp
     const envelope = await createCredentialEnvelope(apiKey, { credentialId, userId: actor.userId, projectId, provider, exp: expiresAt }, env.ENVELOPE_KEYS);
     apiKey = "";
     body.apiKey = "";
-    await env.DB.prepare("INSERT INTO credentials (id, user_id, project_id, provider, key_version, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(credentialId, actor.userId, projectId, provider, envelope.kid, expiresAt, now).run();
+    const inserted = await env.DB.prepare(
+      `INSERT INTO credentials (id,user_id,project_id,provider,key_version,expires_at,created_at)
+       SELECT ?,?,?,?,?,?,? WHERE EXISTS (
+         SELECT 1 FROM providers WHERE provider=? AND enabled=1 AND protocol=? AND base_url=?
+       )`,
+    ).bind(credentialId, actor.userId, projectId, provider, envelope.kid, expiresAt, now, provider, activeProvider.protocol, activeProvider.baseUrl).run();
+    apiKey = "";
+    body.apiKey = "";
+    if (!inserted.meta.changes) return json({ error: "provider_conflict" }, 409);
     await insertAudit(env.DB, actor.userId, "credential.created", "credential", credentialId, { projectId, provider, keyVersion: envelope.kid });
     return json({ credential: { id: credentialId, provider, keyVersion: envelope.kid, expiresAt }, envelope }, 201);
   }

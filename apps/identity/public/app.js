@@ -1252,6 +1252,16 @@ function credentialIdOf(credential) {
   return typeof credential.id === "string" ? credential.id : typeof credential.credentialId === "string" ? credential.credentialId : "";
 }
 
+function parsePublicProviderBaseUrl(value) {
+  try {
+    const endpoint = new URL(value);
+    if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return undefined;
+    return endpoint;
+  } catch {
+    return undefined;
+  }
+}
+
 async function renderProviders() {
   const data = await api.get("/api/providers", { projectId: state.projectId });
   const providers = list(data?.providers);
@@ -1265,7 +1275,7 @@ async function renderProviders() {
   const customProviderBaseUrl = h("input", { className: "input", type: "url", required: "", maxlength: 2048, autocomplete: "off", placeholder: "https://api.example.com/v1" });
   const customProviderForm = isSystemAdmin ? h("form", { className: "panel", autocomplete: "off" },
     h("div", { className: "panel-header" }, h("div", {}, h("h2", {}, "Add a custom provider"), h("p", { className: "panel-description" }, "Register a public HTTPS endpoint that implements the OpenAI chat completions API."))),
-    notice("Only a system administrator can register provider endpoints. The endpoint is immutable after registration; use a new provider ID to add a different endpoint. API keys use the existing encrypted credential form below.", "info"),
+    notice("Only a system administrator can register custom endpoints and change their Base URL. Same-origin path changes retain saved credentials; changing origin revokes every saved credential for that provider and requires reenrollment. Built-in provider endpoints and protocols remain fixed. API keys use the existing encrypted credential form below.", "info"),
     h("div", { className: "form-grid spaced-form-grid" },
       field("Provider ID", customProviderId, "Lowercase ID used for credential ownership and model grants."),
       field("Display name", customProviderName),
@@ -1285,15 +1295,10 @@ async function renderProviders() {
       return;
     }
     if (providers.some((provider) => providerIdOf(provider) === id)) {
-      showInlineError(customProviderForm, new Error("That provider ID is already registered. Provider IDs and endpoints are immutable; choose a new ID."));
+      showInlineError(customProviderForm, new Error("That provider ID is already registered. Choose a different provider ID."));
       return;
     }
-    let endpoint;
-    try { endpoint = new URL(baseUrl); } catch {
-      showInlineError(customProviderForm, new Error("Enter a valid HTTPS base URL."));
-      return;
-    }
-    if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    if (!parsePublicProviderBaseUrl(baseUrl)) {
       showInlineError(customProviderForm, new Error("Provider URLs must use HTTPS and cannot contain credentials, query strings, or fragments."));
       return;
     }
@@ -1313,6 +1318,14 @@ async function renderProviders() {
     h("option", { value: "" }, "Choose a provider"),
     ...enabledProviders.map((provider) => h("option", { value: providerIdOf(provider) }, display(provider.displayName, providerIdOf(provider)))),
   );
+  const keyProviderDestination = h("p", { className: "field-help", role: "status", "aria-live": "polite" }, "Choose a provider to review where this key will be sent.");
+  const updateKeyProviderDestination = () => {
+    const selected = enabledProviders.find((provider) => providerIdOf(provider) === keyProvider.value);
+    keyProviderDestination.textContent = selected
+      ? `This key will be sent to ${display(selected.baseUrl, "the configured provider endpoint")}. Review this endpoint before saving.`
+      : "Choose a provider to review where this key will be sent.";
+  };
+  keyProvider.addEventListener("change", updateKeyProviderDestination);
   const apiKeyInput = h("input", { className: "input", type: "password", maxlength: "8192", autocomplete: "new-password", autocapitalize: "off", spellcheck: "false", placeholder: "Paste provider API key", required: "" });
   const keyForm = h("form", { className: "panel", autocomplete: "off" },
     h("div", { className: "panel-header" }, h("div", {}, h("h2", {}, "Add a provider key"), h("p", { className: "panel-description" }, "This key is encrypted by Identity and is not shown or exported again."))),
@@ -1321,6 +1334,7 @@ async function renderProviders() {
       field("LLM provider", keyProvider, "Choose from the server-configured provider list."),
       field("Provider API key", apiKeyInput, "The raw key is never saved in browser storage or included in exports."),
     ),
+    keyProviderDestination,
     h("div", { className: "form-actions" }, h("button", { className: "button", type: "submit" }, "Encrypt and save")),
   );
   keyForm.addEventListener("submit", async (event) => {
@@ -1335,7 +1349,20 @@ async function renderProviders() {
       return;
     }
     try {
-      const result = await api.post("/api/credentials", { projectId: state.projectId, provider: keyProvider.value, apiKey });
+      const selectedProvider = enabledProviders.find((provider) => providerIdOf(provider) === keyProvider.value);
+      if (!selectedProvider) {
+        apiKey = "";
+        showInlineError(keyForm, new Error("Choose an enabled provider before saving this key."));
+        return;
+      }
+      if (selectedProvider.custom === true && typeof selectedProvider.baseUrl !== "string") {
+        apiKey = "";
+        showInlineError(keyForm, new Error("The selected provider endpoint is unavailable. Reload the provider list before entering a key."));
+        return;
+      }
+      const credentialRequest = { projectId: state.projectId, provider: keyProvider.value, apiKey };
+      if (selectedProvider.custom === true) credentialRequest.expectedBaseUrl = selectedProvider.baseUrl;
+      const result = await api.post("/api/credentials", credentialRequest);
       apiKey = "";
       const envelope = isRecord(result?.envelope) ? result.envelope : undefined;
       if (envelope) {
@@ -1357,7 +1384,16 @@ async function renderProviders() {
       await loadCurrentView();
     } catch (error) {
       apiKey = "";
-      showInlineError(keyForm, error);
+      if (error instanceof ApiError && error.code === "provider_conflict") {
+        try {
+          await loadCurrentView();
+          setLiveMessage("The provider URL changed while you were adding this key. The provider list was refreshed and the key field cleared; review the current endpoint and enter the key again.");
+        } catch (refreshError) {
+          showPageError(refreshError);
+        }
+      } else {
+        showInlineError(keyForm, error);
+      }
     }
   });
 
@@ -1410,22 +1446,111 @@ async function renderProviders() {
       );
     });
     const customRoute = provider.custom === true ? ` · OpenAI-compatible endpoint ${display(provider.baseUrl, "configured by administrator")}` : "";
-    const providerActions = isSystemAdmin && providerId ? h("button", {
+    const providerActions = [];
+    if (isSystemAdmin && providerId) {
+      providerActions.push(h("button", {
+        type: "button",
+        className: `button ${providerIsEnabled ? "danger" : "secondary"} small`,
+        disabled: state.busy,
+        "data-busy-disabled": "true",
+        onClick: async () => {
+          const name = display(provider.displayName, providerId);
+          const nextEnabled = !providerIsEnabled;
+          if (!nextEnabled && !confirmAction(`Disable ${name}? Requests using this provider route will be denied. Existing keys and mappings will remain saved.`)) return;
+          await runAction(
+            () => api.put(`/api/providers/${encodeURIComponent(providerId)}`, { enabled: nextEnabled }),
+            `${name} provider route ${nextEnabled ? "enabled" : "disabled"}.`,
+          );
+        },
+      }, providerIsEnabled ? "Disable provider" : "Enable provider"));
+    }
+    const editBaseUrlButton = isSystemAdmin && provider.custom === true && providerId ? h("button", {
       type: "button",
-      className: `button ${providerIsEnabled ? "danger" : "secondary"} small`,
+      className: "button secondary small",
       disabled: state.busy,
       "data-busy-disabled": "true",
-      onClick: async () => {
-        const name = display(provider.displayName, providerId);
-        const nextEnabled = !providerIsEnabled;
-        if (!nextEnabled && !confirmAction(`Disable ${name}? Requests using this provider route will be denied. Existing keys and mappings will remain saved.`)) return;
-        await runAction(
-          () => api.put(`/api/providers/${encodeURIComponent(providerId)}`, { enabled: nextEnabled }),
-          `${name} provider route ${nextEnabled ? "enabled" : "disabled"}.`,
+      "aria-expanded": "false",
+      onClick: () => {
+        if (state.busy) return;
+        const existingEditor = card.querySelector(".provider-base-url-editor");
+        if (existingEditor) {
+          existingEditor.remove();
+          editBaseUrlButton.setAttribute("aria-expanded", "false");
+          editBaseUrlButton.focus();
+          return;
+        }
+
+        const oldBaseUrl = display(provider.baseUrl, "");
+        const newBaseUrl = h("input", { className: "input", type: "url", required: "", maxlength: 2048, autocomplete: "url", value: oldBaseUrl, "data-busy-disabled": "true" });
+        const editor = h("form", { className: "provider-base-url-editor form-grid spaced-form-grid", autocomplete: "off", "aria-label": `Edit ${display(provider.displayName, providerId)} Base URL` },
+          field("Base URL", newBaseUrl, "Use a public HTTPS URL. Path changes on the same origin retain saved credentials; changing the origin revokes all saved credentials for this provider.", true),
+          h("div", { className: "form-actions full" },
+            h("button", { className: "button primary", type: "submit", disabled: state.busy, "data-busy-disabled": "true" }, "Save Base URL"),
+            h("button", { className: "button secondary", type: "button", disabled: state.busy, "data-busy-disabled": "true", onClick: () => { editor.remove(); editBaseUrlButton.setAttribute("aria-expanded", "false"); editBaseUrlButton.focus(); } }, "Cancel"),
+          ),
         );
+        editor.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          if (!editor.reportValidity()) return;
+          const nextBaseUrl = newBaseUrl.value.trim();
+          const previousUrl = parsePublicProviderBaseUrl(oldBaseUrl);
+          const nextUrl = parsePublicProviderBaseUrl(nextBaseUrl);
+          if (!nextUrl) {
+            showInlineError(editor, new Error("Provider URLs must use HTTPS and cannot contain credentials, query strings, or fragments."));
+            return;
+          }
+          if (!previousUrl) {
+            showInlineError(editor, new Error("The saved provider URL is invalid. Reload the provider list before editing it."));
+            return;
+          }
+          if (nextBaseUrl === oldBaseUrl) {
+            editor.remove();
+            editBaseUrlButton.setAttribute("aria-expanded", "false");
+            setLiveMessage("No Base URL changes were made.");
+            return;
+          }
+
+          const sameOrigin = nextUrl.origin === previousUrl.origin;
+          const name = display(provider.displayName, providerId);
+          const confirmation = sameOrigin
+            ? `Update ${name} Base URL from ${oldBaseUrl} to ${nextBaseUrl}? The origin is unchanged, so saved credential envelopes will be retained.`
+            : `Change ${name} Base URL from ${oldBaseUrl} to ${nextBaseUrl}? This changes the origin. Identity will revoke all saved credentials for this provider globally; users must enroll provider keys again before requests can succeed.`;
+          if (!confirmAction(confirmation)) return;
+
+          setBusy(true);
+          try {
+            const result = await api.put(`/api/providers/${encodeURIComponent(providerId)}`, { baseUrl: nextBaseUrl, expectedBaseUrl: oldBaseUrl });
+            const revokedCount = Number.isSafeInteger(result?.revokedCredentialCount) && result.revokedCredentialCount >= 0 ? result.revokedCredentialCount : undefined;
+            const successMessage = sameOrigin
+              ? `${name} Base URL updated. Saved credential envelopes were retained.`
+              : revokedCount === undefined
+                ? `${name} Base URL updated. Saved credentials were revoked; enroll provider keys again before using this route.`
+                : `${name} Base URL updated. ${revokedCount} saved provider credential${revokedCount === 1 ? " was" : "s were"} revoked; enroll provider keys again before using this route.`;
+            await loadCurrentView();
+            setLiveMessage(successMessage);
+          } catch (error) {
+            if (error instanceof ApiError && error.code === "provider_conflict") {
+              try {
+                await loadCurrentView();
+                setLiveMessage("This provider URL changed in another administrator session. The provider list is refreshed; review the current URL and retry your change.");
+              } catch (refreshError) {
+                showPageError(refreshError);
+              }
+            } else {
+              showInlineError(editor, error);
+            }
+          } finally {
+            setBusy(false);
+          }
+        });
+        card.append(editor);
+        editBaseUrlButton.setAttribute("aria-expanded", "true");
+        newBaseUrl.focus();
       },
-    }, providerIsEnabled ? "Disable provider" : "Enable provider") : null;
-    const card = panel(display(provider.displayName, providerId), `${modelEnabledText(provider)}${customRoute} · project model permissions`, modelRows.length ? h("div", { className: "list" }, ...modelRows) : emptyState("No models mapped", "Add an alias and upstream model below."), providerActions);
+    }, "Edit Base URL") : null;
+    if (editBaseUrlButton) providerActions.push(editBaseUrlButton);
+    const actions = providerActions.length ? h("div", { className: "row-actions" }, ...providerActions) : null;
+    const card = panel(display(provider.displayName, providerId), `${modelEnabledText(provider)}${customRoute} · project model permissions`, modelRows.length ? h("div", { className: "list" }, ...modelRows) : emptyState("No models mapped", "Add an alias and upstream model below."), actions);
     return card;
   });
 

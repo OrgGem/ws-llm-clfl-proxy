@@ -50,6 +50,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("Identity custom provider registry integration", () => {
@@ -187,6 +188,305 @@ describe("Identity custom provider registry integration", () => {
     expect(stored).toEqual({ enabled: 0 });
   });
 
+  it("updates custom routes with CAS, keeps same-origin credentials, and revokes all credentials on origin change", async () => {
+    const created = await browserRequest(admin, "/api/providers", "POST", {
+      id: providerId,
+      displayName: "Private Gateway",
+      baseUrl: publicBaseUrl,
+      protocol: "openai",
+    });
+    expect(created.status, await created.clone().text()).toBe(201);
+
+    const builtinUpdate = await browserRequest(admin, "/api/providers/openai", "PUT", {
+      baseUrl: "https://proxy.example.org/v1/",
+      expectedBaseUrl: "https://api.openai.com/v1/",
+    });
+    expect(builtinUpdate.status).toBe(403);
+
+    const omittedExpected = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: "https://api.example.org/openai/v1/",
+    });
+    expect(omittedExpected.status).toBe(400);
+    expect(await omittedExpected.json()).toMatchObject({ error: "invalid_request" });
+
+    const missingCsrf = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: "https://api.example.org/openai/v1/",
+      expectedBaseUrl: publicBaseUrl,
+    }, false);
+    expect(missingCsrf.status).toBe(403);
+
+    const nonAdmin = await browserRequest(member, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: "https://api.example.org/openai/v1/",
+      expectedBaseUrl: publicBaseUrl,
+    });
+    expect(nonAdmin.status).toBe(403);
+
+    const stale = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: "https://api.example.org/openai/v1/",
+      expectedBaseUrl: "https://stale.example.org/v1/",
+    });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ error: "provider_conflict" });
+
+    const missingCredentialVersion = await browserRequest(member, "/api/credentials", "POST", {
+      projectId: member.projectId,
+      provider: providerId,
+      apiKey: randomProviderSecret(),
+    });
+    expect(missingCredentialVersion.status).toBe(409);
+    expect(await missingCredentialVersion.json()).toMatchObject({ error: "provider_conflict" });
+    const staleCredentialVersion = await browserRequest(member, "/api/credentials", "POST", {
+      projectId: member.projectId,
+      provider: providerId,
+      apiKey: randomProviderSecret(),
+      expectedBaseUrl: "https://stale.example.org/v1/",
+    });
+    expect(staleCredentialVersion.status).toBe(409);
+    expect(await staleCredentialVersion.json()).toMatchObject({ error: "provider_conflict" });
+    const beforeEnrollment = await identityEnv.DB.prepare("SELECT COUNT(*) AS count FROM credentials WHERE provider=?")
+      .bind(providerId).first<{ count: number }>();
+    expect(beforeEnrollment?.count).toBe(0);
+
+    const credentialResponse = await browserRequest(member, "/api/credentials", "POST", {
+      projectId: member.projectId,
+      provider: providerId,
+      apiKey: randomProviderSecret(),
+      expectedBaseUrl: publicBaseUrl,
+    });
+    expect(credentialResponse.status, await credentialResponse.clone().text()).toBe(201);
+    const credential = await credentialResponse.json() as { credential: { id: string } };
+
+    const sameOriginUrl = "https://api.example.org/openai/v1/";
+    const sameOrigin = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: "https://API.EXAMPLE.ORG:443/openai/v1",
+      expectedBaseUrl: publicBaseUrl,
+    });
+    expect(sameOrigin.status, await sameOrigin.clone().text()).toBe(200);
+    expect(await sameOrigin.json()).toMatchObject({
+      provider: { id: providerId, baseUrl: sameOriginUrl, enabled: true },
+      revokedCredentialCount: 0,
+    });
+    let credentialRow = await identityEnv.DB.prepare("SELECT revoked_at FROM credentials WHERE id=?")
+      .bind(credential.credential.id).first<{ revoked_at: number | null }>();
+    expect(credentialRow).toEqual({ revoked_at: null });
+
+    const dnsCountBeforeNoop = dnsRequests.length;
+    const noOp = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: sameOriginUrl,
+      expectedBaseUrl: sameOriginUrl,
+    });
+    expect(noOp.status).toBe(200);
+    expect(await noOp.json()).toMatchObject({ provider: { baseUrl: sameOriginUrl }, revokedCredentialCount: 0 });
+    expect(dnsRequests).toHaveLength(dnsCountBeforeNoop);
+    credentialRow = await identityEnv.DB.prepare("SELECT revoked_at FROM credentials WHERE id=?")
+      .bind(credential.credential.id).first<{ revoked_at: number | null }>();
+    expect(credentialRow).toEqual({ revoked_at: null });
+
+    privateDnsHost = "private-update.integration.example.org";
+    const privateTarget = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: `https://${privateDnsHost}/v2/`,
+      expectedBaseUrl: sameOriginUrl,
+    });
+    expect(privateTarget.status).toBe(400);
+    expect(await privateTarget.json()).toMatchObject({ error: "endpoint_not_allowed" });
+    privateDnsHost = null;
+
+    const newBaseUrl = "https://next.example.net/v2/";
+    const crossOrigin = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: newBaseUrl,
+      expectedBaseUrl: sameOriginUrl,
+    });
+    expect(crossOrigin.status, await crossOrigin.clone().text()).toBe(200);
+    expect(await crossOrigin.json()).toMatchObject({
+      provider: { id: providerId, baseUrl: newBaseUrl, enabled: true },
+      revokedCredentialCount: 1,
+    });
+    credentialRow = await identityEnv.DB.prepare("SELECT revoked_at FROM credentials WHERE id=?")
+      .bind(credential.credential.id).first<{ revoked_at: number | null }>();
+    expect(credentialRow?.revoked_at).toEqual(expect.any(Number));
+    const audit = await identityEnv.DB.prepare(
+      "SELECT action,details_json FROM audit_events WHERE action='provider.base_url_updated' AND target_id=? ORDER BY rowid DESC LIMIT 1",
+    ).bind(providerId).first<{ action: string; details_json: string }>();
+    expect(audit?.action).toBe("provider.base_url_updated");
+    expect(JSON.parse(audit!.details_json)).toEqual({
+      oldBaseUrl: sameOriginUrl,
+      newBaseUrl,
+      originChanged: true,
+      revokedCredentialCount: 1,
+    });
+  });
+
+  it("rejects an enrollment when the observed route changes before the conditional insert", async () => {
+    const created = await browserRequest(admin, "/api/providers", "POST", {
+      id: providerId,
+      displayName: "Private Gateway",
+      baseUrl: publicBaseUrl,
+      protocol: "openai",
+    });
+    expect(created.status).toBe(201);
+
+    await identityEnv.DB.prepare(
+      `CREATE TRIGGER retarget_before_credential_insert AFTER INSERT ON rate_limits
+       BEGIN UPDATE providers SET base_url='https://next.example.net/v1/' WHERE provider='private-gateway'; END`,
+    ).run();
+    const enrollment = await browserRequest(member, "/api/credentials", "POST", {
+      projectId: member.projectId,
+      provider: providerId,
+      apiKey: randomProviderSecret(),
+      expectedBaseUrl: publicBaseUrl,
+    });
+    await identityEnv.DB.prepare("DROP TRIGGER retarget_before_credential_insert").run();
+    expect(enrollment.status).toBe(409);
+    expect(await enrollment.json()).toMatchObject({ error: "provider_conflict" });
+    const updatedProvider = await identityEnv.DB.prepare("SELECT base_url AS baseUrl FROM providers WHERE provider=?")
+      .bind(providerId).first<{ baseUrl: string }>();
+    expect(updatedProvider?.baseUrl).toBe("https://next.example.net/v1/");
+    const credentials = await identityEnv.DB.prepare("SELECT id,revoked_at FROM credentials WHERE provider=?")
+      .bind(providerId).all<{ id: string; revoked_at: number | null }>();
+    expect(credentials.results).toEqual([]);
+  });
+
+  it("rolls back route changes and credential revocation if the audit insert fails", async () => {
+    const created = await browserRequest(admin, "/api/providers", "POST", {
+      id: providerId,
+      displayName: "Private Gateway",
+      baseUrl: publicBaseUrl,
+      protocol: "openai",
+    });
+    expect(created.status).toBe(201);
+    const credentialResponse = await browserRequest(member, "/api/credentials", "POST", {
+      projectId: member.projectId,
+      provider: providerId,
+      apiKey: randomProviderSecret(),
+      expectedBaseUrl: publicBaseUrl,
+    });
+    expect(credentialResponse.status).toBe(201);
+    const credential = await credentialResponse.json() as { credential: { id: string } };
+    await identityEnv.DB.prepare(
+      `CREATE TRIGGER fail_provider_base_audit BEFORE INSERT ON audit_events
+       WHEN NEW.action='provider.base_url_updated'
+       BEGIN SELECT RAISE(ABORT,'integration audit failure'); END`,
+    ).run();
+
+    let response: Response;
+    try {
+      response = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+        baseUrl: "https://next.example.net/v1/",
+        expectedBaseUrl: publicBaseUrl,
+      });
+    } finally {
+      await identityEnv.DB.prepare("DROP TRIGGER fail_provider_base_audit").run();
+    }
+
+    expect(response!.status).toBe(500);
+    const provider = await identityEnv.DB.prepare("SELECT base_url AS baseUrl FROM providers WHERE provider=?")
+      .bind(providerId).first<{ baseUrl: string }>();
+    const storedCredential = await identityEnv.DB.prepare("SELECT revoked_at FROM credentials WHERE id=?")
+      .bind(credential.credential.id).first<{ revoked_at: number | null }>();
+    expect(provider).toEqual({ baseUrl: publicBaseUrl });
+    expect(storedCredential).toEqual({ revoked_at: null });
+  });
+
+  it("does not send an old credential to a newly retargeted endpoint during connection test DNS validation", async () => {
+    const created = await browserRequest(admin, "/api/providers", "POST", {
+      id: providerId,
+      displayName: "Private Gateway",
+      baseUrl: publicBaseUrl,
+      protocol: "openai",
+    });
+    expect(created.status).toBe(201);
+    const credentialResponse = await browserRequest(member, "/api/credentials", "POST", {
+      projectId: member.projectId,
+      provider: providerId,
+      apiKey: randomProviderSecret(),
+      expectedBaseUrl: publicBaseUrl,
+    });
+    expect(credentialResponse.status).toBe(201);
+    const credential = await credentialResponse.json() as { credential: { id: string }; envelope: unknown };
+
+    let routeChangedDuringDns = false;
+    let providerCalls = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.origin === "https://cloudflare-dns.com" && url.pathname === "/dns-query") {
+        const name = url.searchParams.get("name");
+        const type = url.searchParams.get("type");
+        dnsRequests.push(url);
+        if (name === "api.example.org" && !routeChangedDuringDns) {
+          routeChangedDuringDns = true;
+          const changedAt = Math.floor(Date.now() / 1000);
+          await identityEnv.DB.batch([
+            identityEnv.DB.prepare("UPDATE providers SET base_url='https://next.example.net/v1/' WHERE provider=? AND base_url=?")
+              .bind(providerId, publicBaseUrl),
+            identityEnv.DB.prepare("UPDATE credentials SET revoked_at=? WHERE provider=? AND revoked_at IS NULL")
+              .bind(changedAt, providerId),
+          ]);
+        }
+        const answer = type === "A" ? [{ name, type: 1, TTL: 300, data: "8.8.8.8" }] : undefined;
+        return new Response(JSON.stringify({ Status: 0, ...(answer ? { Answer: answer } : {}) }), {
+          status: 200,
+          headers: { "content-type": "application/dns-json" },
+        });
+      }
+      providerCalls += 1;
+      return new Response("unexpected provider call", { status: 200 });
+    });
+
+    const response = await browserRequest(member, `/api/credentials/${credential.credential.id}/test`, "POST", {
+      envelope: credential.envelope,
+    });
+    expect(routeChangedDuringDns).toBe(true);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: "forbidden" });
+    expect(providerCalls).toBe(0);
+  });
+
+  it("does not update a custom route when the admin session is revoked during DNS validation", async () => {
+    const created = await browserRequest(admin, "/api/providers", "POST", {
+      id: providerId,
+      displayName: "Private Gateway",
+      baseUrl: publicBaseUrl,
+      protocol: "openai",
+    });
+    expect(created.status).toBe(201);
+
+    dnsRequests = [];
+    let unblockDns!: () => void;
+    let dnsStarted!: () => void;
+    const dnsGate = new Promise<void>((resolve) => { unblockDns = resolve; });
+    const bothDnsQueriesStarted = new Promise<void>((resolve) => { dnsStarted = resolve; });
+    let pendingDns = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      dnsRequests.push(url);
+      pendingDns += 1;
+      if (pendingDns === 2) dnsStarted();
+      await dnsGate;
+      const type = url.searchParams.get("type");
+      const answer = type === "A" ? [{ name: "api.example.org", type: 1, TTL: 300, data: "8.8.8.8" }] : undefined;
+      return new Response(JSON.stringify({ Status: 0, ...(answer ? { Answer: answer } : {}) }), {
+        status: 200,
+        headers: { "content-type": "application/dns-json" },
+      });
+    });
+
+    const updating = browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: "https://api.example.org/openai/v1/",
+      expectedBaseUrl: publicBaseUrl,
+    });
+    await bothDnsQueriesStarted;
+    await identityEnv.DB.prepare("UPDATE sessions SET revoked_at=? WHERE browser_token_hash=?")
+      .bind(Math.floor(Date.now() / 1000), await sha256Base64Url(admin.browserToken)).run();
+    unblockDns();
+
+    const response = await updating;
+    expect(response.status).toBe(403);
+    expect(dnsRequests.map((url) => url.searchParams.get("type")).sort()).toEqual(["A", "AAAA"]);
+    const stored = await identityEnv.DB.prepare("SELECT base_url AS baseUrl FROM providers WHERE provider=?")
+      .bind(providerId).first<{ baseUrl: string }>();
+    expect(stored).toEqual({ baseUrl: publicBaseUrl });
+  });
+
   it("authorizes only granted models and owner credentials, returning the registry endpoint rather than a client-supplied URL", async () => {
     const registered = await browserRequest(admin, "/api/providers", "POST", {
       id: providerId,
@@ -236,6 +536,7 @@ describe("Identity custom provider registry integration", () => {
       projectId: member.projectId,
       provider: providerId,
       apiKey: randomProviderSecret(),
+      expectedBaseUrl: publicBaseUrl,
     });
     expect(ownCredentialResponse.status).toBe(201);
     const ownCredential = await ownCredentialResponse.json() as { credential: { id: string } };
@@ -244,6 +545,7 @@ describe("Identity custom provider registry integration", () => {
       projectId: foreign.projectId,
       provider: providerId,
       apiKey: randomProviderSecret(),
+      expectedBaseUrl: publicBaseUrl,
     });
     expect(foreignCredentialResponse.status).toBe(201);
     const foreignCredential = await foreignCredentialResponse.json() as { credential: { id: string } };
@@ -289,6 +591,41 @@ describe("Identity custom provider registry integration", () => {
       model: modelAlias,
     });
     expect(deniedModel).toMatchObject({ allowed: false, reasonCode: "provider_or_model_not_allowed" });
+
+    await env.DB.prepare("INSERT INTO project_permissions (project_id,provider,model,created_by,created_at) VALUES (?,?,?,?,?)")
+      .bind(member.projectId, providerId, modelAlias, member.userId, Math.floor(Date.now() / 1000)).run();
+    const sameOriginUrl = "https://api.example.org/openai/v1/";
+    const sameOrigin = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: sameOriginUrl,
+      expectedBaseUrl: publicBaseUrl,
+    });
+    expect(sameOrigin.status).toBe(200);
+    const retained = await identityInternal.authorizeTokenRequest({
+      accessToken: token,
+      credentialId: ownCredential.credential.id,
+      provider: providerId,
+      model: modelAlias,
+    });
+    expect(retained.allowed).toBe(true);
+    expect(retained.authorizedProvider?.baseUrl).toBe(sameOriginUrl);
+
+    const crossOrigin = await browserRequest(admin, `/api/providers/${providerId}`, "PUT", {
+      baseUrl: "https://next.example.net/v2/",
+      expectedBaseUrl: sameOriginUrl,
+    });
+    expect(crossOrigin.status).toBe(200);
+    expect(await crossOrigin.json()).toMatchObject({ revokedCredentialCount: 2 });
+    const globallyRevoked = await identityEnv.DB.prepare(
+      "SELECT COUNT(*) AS count FROM credentials WHERE provider=? AND revoked_at IS NOT NULL",
+    ).bind(providerId).first<{ count: number }>();
+    expect(globallyRevoked?.count).toBe(2);
+    const oldEnvelopeRejected = await identityInternal.authorizeTokenRequest({
+      accessToken: token,
+      credentialId: ownCredential.credential.id,
+      provider: providerId,
+      model: modelAlias,
+    });
+    expect(oldEnvelopeRejected).toMatchObject({ allowed: false, reasonCode: "credential_revoked" });
   });
 });
 
