@@ -26,12 +26,13 @@
   "env": {
     "staging": {
       "name": "ws-llm-gateway-staging",
+      "routes": [{ "pattern": "llm.gemslab.id.vn/v1/socket", "zone_name": "gemslab.id.vn" }],
       "secrets": {
         "required": ["ENVELOPE_KEYS"]
       },
       "vars": {
         "GATEWAY_ENVIRONMENT": "staging",
-        "MACHINE_ISSUER": "https://ws-llm-identity-staging.rpa-money.workers.dev"
+        "MACHINE_ISSUER": "https://llm.gemslab.id.vn"
       },
       "services": [
         {

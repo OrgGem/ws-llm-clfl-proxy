@@ -35,6 +35,25 @@ beforeEach(async () => {
 });
 
 describe("Identity public Worker routes", () => {
+  it("serves the control room and its module assets under /ui", async () => {
+    const root = await SELF.fetch(`${identityEnv.PUBLIC_ORIGIN}/`, { redirect: "manual" });
+    expect(root.status).toBe(303);
+    expect(root.headers.get("location")).toBe("/ui");
+    for (const path of ["/ui", "/ui/"]) {
+      const page = await SELF.fetch(`${identityEnv.PUBLIC_ORIGIN}${path}`);
+      expect(page.status).toBe(200);
+      const html = await page.text();
+      expect(html).toContain('src="/ui/app.js"');
+      expect(html).toContain('href="/ui/app.css"');
+    }
+    for (const path of ["app.js", "api.js", "bootstrap.js", "dates.js", "app.css"]) {
+      const asset = await SELF.fetch(`${identityEnv.PUBLIC_ORIGIN}/ui/${path}`);
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+    const denied = await SELF.fetch(`${identityEnv.PUBLIC_ORIGIN}/ui/internal/authorize`);
+    expect(denied.status).toBe(404);
+  });
   it("issues a short-lived ES256 access token for a confidential client", async () => {
     const response = await postForm({ grant_type: "client_credentials" }, {
       authorization: `Basic ${btoa(`${fixture.confidentialClientId}:${fixture.confidentialClientSecret}`)}`,

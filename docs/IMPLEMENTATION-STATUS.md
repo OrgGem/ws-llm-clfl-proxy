@@ -38,3 +38,11 @@ Deployed binding inspection confirmed Gateway has `IDENTITY` → `ws-llm-identit
 - No headless or manual browser visual flow has been completed. UI syntax, API helpers, bootstrap parser compatibility and timestamp behavior are tested.
 - GitHub template metadata change was rejected with HTTP 403 by the integration; the template flag is not enabled.
 - Production has not been deployed. Real staging login/provider/benchmark evidence remains required before production acceptance.
+
+## Custom-domain deployment — 2026-10-18
+
+User confirmed `llm.gemslab.id.vn`, since the connected Cloudflare account has the active `gemslab.id.vn` zone and no `.id.com` zone. Gateway deployed first (`d06bc1cdf29341d9a357481400ff33b4`), then Identity/UI (`61be05973867461fad492999bddfa4d3`), preserving existing secrets, private RPC bindings and staging D1. Identity custom domain and managed certificate were created; the exact `/v1/socket` zone route targets Gateway. The environment still uses the staging resources, not an independently provisioned production database.
+
+Live HTTPS checks with a browser User-Agent: `/ui`, `/ui/`, UI modules/styles, `/api/session`, and public JWKS returned 200; the public internal path returned 404; ordinary HTTP to `/v1/socket` returned 426; a real TLS WebSocket handshake without credentials returned 401. `/api/session` explicitly reports `authSetupRequired:true`. The zone's existing edge policy rejects Python's default User-Agent with Cloudflare 1010; that policy was preserved. Authenticated provider streaming and real OIDC login were not re-tested and remain external gates.
+
+Added a runtime integration test for `/ui`, prefixed modules/styles, root redirect and internal-route denial; all 15 Identity runtime integration tests passed. All 8 Gateway runtime integration tests passed during this change. Workspace typechecking, UI syntax checks and both Worker dry-run bundles passed. An initial test caught the static asset index canonical redirect loop; internal root asset lookup fixed it before deployment. Test OIDC public origin is now explicitly isolated from deployment configuration.

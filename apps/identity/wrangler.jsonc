@@ -54,6 +54,7 @@
   "env": {
     "staging": {
       "name": "ws-llm-identity-staging",
+      "routes": [{ "pattern": "llm.gemslab.id.vn", "custom_domain": true }],
       "secrets": {
         "required": [
           "MACHINE_JWT_PRIVATE_JWK",
@@ -63,10 +64,10 @@
         ]
       },
       "vars": {
-        "MACHINE_ISSUER": "https://ws-llm-identity-staging.rpa-money.workers.dev",
+        "MACHINE_ISSUER": "https://llm.gemslab.id.vn",
         "MACHINE_JWT_PUBLIC_JWKS": "{\"keys\":[{\"kty\":\"EC\",\"x\":\"WX6IKbhoxGQt6paVJP2NgSOplMfZLLWcwh-XPO8o2b4\",\"y\":\"2UDsySDcD8UAMnEVuTd3VRB_ZcdFMz4ujSjvdubfXZM\",\"crv\":\"P-256\",\"kid\":\"staging-bc8f93c38620f52f\",\"alg\":\"ES256\",\"use\":\"sig\"}]}",
-        "PUBLIC_ORIGIN": "https://ws-llm-identity-staging.rpa-money.workers.dev",
-        "GATEWAY_URL": "wss://ws-llm-gateway-staging.rpa-money.workers.dev/v1/socket"
+        "PUBLIC_ORIGIN": "https://llm.gemslab.id.vn",
+        "GATEWAY_URL": "wss://llm.gemslab.id.vn/v1/socket"
       },
       "d1_databases": [
         {

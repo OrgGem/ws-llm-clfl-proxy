@@ -76,3 +76,15 @@ The local adapter honors standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` en
 ## GitHub template setting
 
 The repository can be pushed through the current integration. Updating repository metadata to `is_template=true` returned HTTP 403 (`Resource not accessible by integration`) during bootstrap implementation. The GitHub account owner can enable **Settings → General → Template repository**, or provide an integration permission that allows repository administration. Until that setting is verified, use the repository by clone/fork; do not describe its GitHub template flag as enabled.
+
+## Custom domain (2026-10-18)
+
+The user confirmed `llm.gemslab.id.vn` (the connected zone), replacing the initially requested `.id.com` spelling. The existing staging Workers and D1 remain the deployment environment; this domain mapping is not a completed production acceptance.
+
+- Identity custom domain: `llm.gemslab.id.vn` → `ws-llm-identity-staging`.
+- UI: `https://llm.gemslab.id.vn/ui`; `/ui/` also works. `/` redirects to `/ui`. UI modules/styles are served under `/ui/`; authentication and management API paths remain at `/auth`, `/oauth`, `/pairing`, `/api` and `/.well-known/jwks.json`.
+- Exact zone route `llm.gemslab.id.vn/v1/socket` → `ws-llm-gateway-staging` overrides the Identity custom-domain origin. Socket URL: `wss://llm.gemslab.id.vn/v1/socket`.
+- Both Workers use `https://llm.gemslab.id.vn` as issuer; Identity uses that public origin and exports the custom-domain Gateway URL. Previously issued tokens using the workers.dev issuer must be replaced. Existing signing/encryption secrets and database are preserved.
+- Register `https://llm.gemslab.id.vn/auth/oidc/callback` in the external OIDC application and set its exact `redirectUri` before enabling login. OIDC remains unconfigured; the UI reports setup required.
+
+Cloudflare manages the custom-domain DNS and TLS certificate. Gateway route and Identity custom domain are recorded in the staging Wrangler environment for repeatable deployments. Deploy Gateway before Identity when applying this mapping. Never overwrite other zone routes.

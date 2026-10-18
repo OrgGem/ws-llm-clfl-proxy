@@ -141,7 +141,11 @@ function readCookie(header: string | null, wanted: string): string | null {
 
 async function serveAsset(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  if (url.pathname === "/pair") url.pathname = "/index.html";
+  if (url.pathname === "/pair" || url.pathname === "/ui" || url.pathname === "/ui/") {
+    url.pathname = "/";
+  } else if (url.pathname.startsWith("/ui/")) {
+    url.pathname = url.pathname.slice(3);
+  }
   const assetRequest = new Request(url, request);
   const response = await env.ASSETS.fetch(assetRequest);
   const headers = new Headers(response.headers);
@@ -157,6 +161,7 @@ async function serveAsset(request: Request, env: Env): Promise<Response> {
 async function fetchIdentity(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
+  if (path === "/" && (request.method === "GET" || request.method === "HEAD")) return redirect("/ui");
   if (path.startsWith("/internal/")) return json({ error: "not_found" }, 404);
   if ((path === "/.well-known/jwks.json" || path === "/.well-known/jwks") && request.method === "GET") {
     try {

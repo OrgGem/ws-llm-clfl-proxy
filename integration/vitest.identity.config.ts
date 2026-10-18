@@ -31,6 +31,7 @@ const oidcProviders = JSON.stringify([
 ]);
 const bindings = {
   MACHINE_ISSUER: issuer,
+  PUBLIC_ORIGIN: issuer,
   MACHINE_JWT_PRIVATE_JWK: JSON.stringify(privateJwk),
   MACHINE_JWT_PUBLIC_JWKS: JSON.stringify({ keys: [publicJwk] }),
   ENVELOPE_KEYS: JSON.stringify({ current: "integration-envelope-key", keys: { "integration-envelope-key": randomBytes(32).toString("base64url") } }),
