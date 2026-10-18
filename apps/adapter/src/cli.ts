@@ -3,9 +3,11 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { configureConfidentialClient, createDeviceLabel, pairPublicClient, readClientBootstrapFile } from "./auth.js";
 import { ConfigError, ConfigStore, defaultConfigPath, validateConfig } from "./config.js";
+import { createEnvironmentConfigStore, EnvironmentConfigStore, hasEnvironmentRuntimeSettings, loadPrivateEnvFile } from "./env-config.js";
 import type { CredentialEnvelope, ProviderProtocol } from "./types.js";
 import { startAdapter } from "./server.js";
 import { ChatGptOAuthManager, OAuthConnectorError } from "./oauth.js";
+import { RequestCommandError, runRequestCommand } from "./request.js";
 
 const HELP = `OpenAI-compatible local adapter
 
@@ -22,6 +24,7 @@ Commands:
   oauth model add --id MODEL_ALIAS --profile PROFILE_ID
   oauth model remove --id MODEL_ALIAS
   oauth logout chatgpt --profile PROFILE_ID
+  request --api chat.completions|responses|completions [--input FILE|-]
   token
   serve
   config-path
@@ -30,15 +33,28 @@ Set WS_PROXY_ADAPTER_CONFIG to choose a config file. Confidential setup reads
 WS_PROXY_CLIENT_SECRET from the environment so it does not enter shell history.
 Set WS_PROXY_ADAPTER_MAX_GATEWAY_SESSIONS=1 for single-socket benchmark runs.
 
+Use --config-env FILE to load a protected dotenv file before any command. Agent
+runtime mode requires WS_PROXY_CONFIG_SOURCE=env and Identity/Gateway URLs,
+confidential client credentials, local bearer token, protected envelope path,
+one model alias, provider ID, and protocol in WS_PROXY_* environment variables.
+Environment runtime state stays in memory and is not written to adapter.json.
+request reads JSON from stdin by default or --input FILE, inserts the only
+configured model alias when model is omitted, and writes only JSON or SSE to stdout.
+
 ChatGPT subscription OAuth is a local loopback sign-in. The browser must reach
 the adapter host at 127.0.0.1; Claude subscription OAuth is unavailable. Cloud
 inference remains disabled until the operator verifies connector eligibility.
 `;
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
-  const [command, ...args] = argv;
-  const store = new ConfigStore(defaultConfigPath());
   try {
+    const invocation = extractEnvFileOption(argv);
+    if (invocation.envFile) await loadPrivateEnvFile(invocation.envFile);
+    const [command, ...args] = invocation.args;
+    const store = await createCliConfigStore();
+    if (store instanceof EnvironmentConfigStore && !isEnvironmentCommand(command, args)) {
+      throw new ConfigError("This command is not available in environment runtime mode");
+    }
     switch (command) {
       case "pair": {
         const options = parseOptions(args);
@@ -157,6 +173,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         await runOAuthCommand(args, store);
         return;
       }
+      case "request": {
+        await runRequestCommand(args, store);
+        return;
+      }
       case "token": {
         const config = await store.load();
         process.stdout.write(`${config.localBearerToken}\n`);
@@ -164,16 +184,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       case "serve": {
         if (args.length !== 0) throw new ConfigError("Usage: serve");
-        const oauthManager = new ChatGptOAuthManager(store);
+        const oauthManager = store instanceof EnvironmentConfigStore ? undefined : new ChatGptOAuthManager(store);
         let server;
         try {
-          server = await startAdapter({ configStore: store, oauthManager });
+          server = await startAdapter({ configStore: store, ...(oauthManager ? { oauthManager } : {}) });
         } catch (error) {
-          await oauthManager.close();
+          await oauthManager?.close();
           throw error;
         }
         process.stdout.write(`Adapter listening on http://127.0.0.1:${server.port}\n`);
-        const close = () => { void server.close().finally(() => oauthManager.close()).finally(() => process.exit(0)); };
+        const close = () => { void server.close().finally(() => oauthManager?.close()).finally(() => process.exit(0)); };
         process.once("SIGINT", close);
         process.once("SIGTERM", close);
         return;
@@ -191,10 +211,72 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         throw new ConfigError(`Unknown command: ${command}`);
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Adapter command failed";
+    const message = error instanceof RequestCommandError
+      ? error.message
+      : error instanceof Error ? error.message : "Adapter command failed";
     process.stderr.write(`${message}\n`);
     process.exitCode = 1;
   }
+}
+
+async function createCliConfigStore(): Promise<ConfigStore> {
+  const source = process.env.WS_PROXY_CONFIG_SOURCE;
+  if (source === "env") return createEnvironmentConfigStore();
+  if (source !== undefined) throw new ConfigError("WS_PROXY_CONFIG_SOURCE must be env when set");
+  if (hasEnvironmentRuntimeSettings()) {
+    throw new ConfigError("Partial runtime environment settings are present; set WS_PROXY_CONFIG_SOURCE=env or clear them");
+  }
+  return new ConfigStore(defaultConfigPath());
+}
+
+function isEnvironmentCommand(command: string | undefined, args: string[]): boolean {
+  if (command === "serve" && args.length === 0) return true;
+  if (command === "request") return true;
+  if (command === "help" || command === "--help" || command === "-h" || command === undefined) return true;
+  return command === "model" && args.length === 1 && args[0] === "list";
+}
+
+function extractEnvFileOption(argv: string[]): { args: string[]; envFile?: string } {
+  const args: string[] = [];
+  let envFile: string | undefined;
+  const valueOptions = new Set([
+    "--api", "--input", "--identity-url", "--gateway-url", "--name", "--client-id", "--protocol",
+    "--provider", "--credential-id", "--id", "--profile", "--port", "--identity", "--project",
+  ]);
+  const flags = new Set(["--print-url", "--cached"]);
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--config-env") {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("--")) throw new ConfigError("Missing value for --config-env");
+      if (envFile) throw new ConfigError("Duplicate option --config-env");
+      envFile = value;
+      index += 1;
+      continue;
+    }
+    if (token?.startsWith("--config-env=")) {
+      const value = token.slice("--config-env=".length);
+      if (!value) throw new ConfigError("Missing value for --config-env");
+      if (envFile) throw new ConfigError("Duplicate option --config-env");
+      envFile = value;
+      continue;
+    }
+    args.push(token as string);
+    if (valueOptions.has(token as string)) {
+      const value = argv[index + 1];
+      if (value !== undefined && !value.startsWith("--")) {
+        args.push(value);
+        index += 1;
+      }
+    } else if (token?.startsWith("--") && !flags.has(token)) {
+      const value = argv[index + 1];
+      if (value !== undefined && !value.startsWith("--")) {
+        args.push(value);
+        index += 1;
+      }
+    }
+  }
+  return { args, ...(envFile === undefined ? {} : { envFile }) };
 }
 
 async function runOAuthCommand(args: string[], store: ConfigStore): Promise<void> {

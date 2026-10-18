@@ -1,0 +1,27 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "If weather lookup is needed, return a structured lookup_weather tool call. Do not claim the tool ran."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_weather",
+        "description": "Return weather for a city. This example only describes a tool schema; the adapter never invokes it.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" }
+          },
+          "required": ["city"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "stream": false
+}

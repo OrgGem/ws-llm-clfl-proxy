@@ -2,13 +2,21 @@
 
 The adapter runs on the user's machine and exposes `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses` and `POST /v1/completions` on `127.0.0.1`. It obtains a machine access token from Identity over HTTPS and sends that token in the Gateway WSS `Authorization` header. Confidential client credentials use OAuth HTTP Basic authentication over HTTPS. Local auth state is stored in an owner-only config file. The adapter is not a hosted service.
 
-Build the workspace and run the packaged CLI with Node 22.13 or newer:
+Build the workspace and run the packaged CLI with Node 22.13 or newer (adapter 0.5.0):
 
 ```sh
 npm ci
 npm run build
 node apps/adapter/dist/bin.js help
 ```
+
+Use a protected environment file with `--config-env FILE` before any command. The adapter reads it as data, checks owner-only permissions, and never runs it as shell code. For an agent request without a persistent server:
+
+```sh
+node apps/adapter/dist/bin.js --config-env .env request --api chat.completions < request.json
+```
+
+`request` accepts `chat.completions`, `responses`, or `completions`, reads JSON from stdin by default (or `--input FILE|-`), inserts the configured alias when `model` is omitted, and writes JSON or SSE to stdout. It returns nonzero for HTTP errors, stream errors, interruption, and a native Responses `response.incomplete` terminal. The command starts a short-lived loopback server internally and shuts it down after the request; a persistent `serve` process is not needed. See the [agent client guide](https://github.com/OrgGem/ws-llm-clfl-proxy/blob/main/docs/AGENT-CLIENT.md) and [copyable template](https://github.com/OrgGem/ws-llm-clfl-proxy/tree/main/templates/ws-llm-agent).
 
 For public desktop pairing, run:
 
@@ -63,7 +71,7 @@ Configure an OpenAI client with base URL `http://127.0.0.1:43128/v1`, API key fr
 
 The executable in `dist/bin.js` is bundled with the shared protocol code. To create a local tarball for distribution alongside the client, run `npm pack --workspace @ws-proxy/adapter`. The package remains private to this repository and is not published by the build.
 
-## Generation API support (adapter 0.3.0)
+## Generation API support (adapter 0.5.0)
 
 | Local endpoint | Provider protocol | Streaming and JSON behavior |
 | --- | --- | --- |
@@ -112,7 +120,7 @@ The prompt file must be owner-only and at most 64 KiB. Its contents are sent to 
 
 Use a registered Go Base URL such as `https://opencode.ai/inference/go/openai/v1`. Gateway adds its own honest application User-Agent and an opaque session ID stable for the WebSocket lifetime; reconnect creates a new session. Chat requests preserve explicit `reasoning_effort` (including `max` when supported by the model) without a global default. Go/DeepSeek streams may omit intermediate `finish_reason`; the adapter accepts this but still requires a real finish reason and `[DONE]` before success. Real tests passed JSON, text SSE and tool-call SSE with `reasoning_effort: "max"` and `tool_choice: "auto"`. A forced named tool choice with reasoning returned upstream 400; automatic selection succeeded. Native Responses/completions support on this provider was not verified in these tests.
 
-### Client-owned ChatGPT OAuth (adapter 0.4.0)
+### Client-owned ChatGPT OAuth (adapter 0.5.0)
 
 The cloud Providers UI can pair with this adapter using a one-use Identity grant and a code printed in the local terminal. ChatGPT login, ID/access-token validation, model discovery, refresh/rotation and refresh-token storage run in the adapter. The separate private OAuth file stores refresh tokens; raw access tokens stay in memory and never enter the browser UI or WebSocket frames. The cloud receives only short-lived access tokens over authenticated HTTPS to create envelopes. Generation WSS requests carry those encrypted envelopes, with the ordinary system token authorizing the Gateway separately.
 
