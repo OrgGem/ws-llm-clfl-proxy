@@ -1,0 +1,1021 @@
+use crate::types::*;
+use tokio::sync::mpsc;
+
+use super::model::ModelConfig;
+
+/// Events emitted during LLM streaming
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum StreamEvent {
+    /// Stream started, partial assistant message
+    Start,
+    /// Text content delta
+    TextDelta { content_index: usize, delta: String },
+    /// Thinking content delta
+    ThinkingDelta { content_index: usize, delta: String },
+    /// Tool call started
+    ToolCallStart {
+        content_index: usize,
+        id: String,
+        name: String,
+    },
+    /// Tool call argument delta
+    ToolCallDelta { content_index: usize, delta: String },
+    /// Tool call ended
+    ToolCallEnd { content_index: usize },
+    /// Stream completed successfully
+    Done { message: Message },
+    /// Stream errored
+    Error { message: Message },
+}
+
+/// Configuration for a streaming LLM call.
+///
+/// Marked `#[non_exhaustive]`: fields are added in minor releases (this
+/// release alone added `output_schema`). Construct with
+/// [`StreamConfig::new`] and mutate the public fields:
+///
+/// ```
+/// # use agent::provider::StreamConfig;
+/// let mut config = StreamConfig::new("claude-sonnet-5", "sk-key");
+/// config.system_prompt = "be brief".into();
+/// ```
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct StreamConfig {
+    pub model: String,
+    pub system_prompt: String,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolDefinition>,
+    pub thinking_level: ThinkingLevel,
+    pub api_key: String,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    /// Optional model configuration for multi-provider support.
+    /// When set, providers use this for base_url, compat flags, headers, etc.
+    pub model_config: Option<ModelConfig>,
+    /// Prompt caching configuration. Default: enabled with auto strategy.
+    pub cache_config: CacheConfig,
+    /// Structured-output constraint. When set, providers enforce the schema
+    /// natively (Anthropic: forced tool call; OpenAI-compat: `json_schema`
+    /// response format; Gemini: `responseSchema`). Providers without support
+    /// log a warning and ignore it.
+    pub output_schema: Option<OutputSchema>,
+}
+
+/// Redacts `api_key`. A `{:?}` of this struct reaches logs and panic
+/// messages; a derived `Debug` would print the credential verbatim.
+impl std::fmt::Debug for StreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamConfig")
+            .field("model", &self.model)
+            .field("system_prompt", &self.system_prompt)
+            .field("messages", &self.messages)
+            .field("tools", &self.tools)
+            .field("thinking_level", &self.thinking_level)
+            .field("api_key", &Redacted(&self.api_key))
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("model_config", &self.model_config)
+            .field("cache_config", &self.cache_config)
+            .field("output_schema", &self.output_schema)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Prints a placeholder instead of a secret, preserving only whether one is set.
+pub(crate) struct Redacted<'a>(pub(crate) &'a str);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            f.write_str("\"\"")
+        } else {
+            f.write_str("\"[redacted]\"")
+        }
+    }
+}
+
+impl StreamConfig {
+    /// A config with the given model and API key; everything else defaults
+    /// (empty prompt/messages/tools, thinking off, caching enabled).
+    pub fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: api_key.into(),
+            max_tokens: None,
+            temperature: None,
+            model_config: None,
+            cache_config: CacheConfig::default(),
+            output_schema: None,
+        }
+    }
+
+    /// The cache-routing key for this request, or `None` when no key should be
+    /// sent.
+    ///
+    /// Returns [`CacheConfig::session_key`] when the caller set a non-blank
+    /// one. Otherwise derives a key from the **system prompt alone**.
+    ///
+    /// # Why only the system prompt
+    ///
+    /// `prompt_cache_key` routes a request to a machine; the cache itself is
+    /// content-addressed. So the key should group requests that share a
+    /// *cacheable prefix*, and the system prompt is exactly that prefix —
+    /// it is what the provider caches, and `StreamConfig` carries it in its
+    /// own field where compaction cannot reach it.
+    ///
+    /// An earlier version also mixed in the first user message, for session
+    /// discrimination. That was wrong, and measurably so: compaction rewrites
+    /// the head. When [`crate::context::compact_messages`] drops far enough to
+    /// re-enter `keep_within_budget`, it inserts a *constant* marker message at
+    /// index 0 — constant on purpose, so the cached prefix stays byte-stable.
+    /// The derived key then drifted mid-session **and** collapsed onto one
+    /// value for every session sharing a system prompt. Session identity is not
+    /// recoverable from a per-request snapshot; inferring it from mutable
+    /// content produced a key that failed exactly on long sessions, which are
+    /// the ones caching exists for.
+    ///
+    /// # Consequence, and the escape hatch
+    ///
+    /// Sessions sharing a system prompt now share a key **by design**. That is
+    /// the correct grouping — they share the cached prefix — but it also
+    /// concentrates traffic on one cache. High-volume deployments should set
+    /// [`CacheConfig::session_key`] explicitly to spread load, which is also
+    /// what OpenAI recommends for a hot key.
+    ///
+    /// Only consumed by key-routed protocols; providers taking explicit
+    /// breakpoints ignore it.
+    pub fn cache_session_key(&self) -> Option<String> {
+        let cache = &self.cache_config;
+        if !cache.hints_enabled() {
+            return None;
+        }
+        // A blank explicit key is worse than none: it would send
+        // `prompt_cache_key: ""` and route every such caller together. Treat it
+        // as unset rather than honouring it literally.
+        if let Some(key) = cache.session_key.as_deref().map(str::trim) {
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+
+        match self.system_prompt.trim() {
+            "" => None,
+            sys => Some(format!("yo-{:016x}", fnv1a(sys))),
+        }
+    }
+}
+
+/// FNV-1a. Chosen over `DefaultHasher` for the same reason the GASP recorder
+/// does: `DefaultHasher` is neither guaranteed stable across Rust releases nor
+/// documented as such, and a cache key that moves between compiler versions
+/// silently stops matching.
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// JSON-Schema constraint for structured outputs.
+///
+/// Marked `#[non_exhaustive]`: fields may be added in minor releases (e.g.
+/// strictness flags). Construct with [`OutputSchema::new`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OutputSchema {
+    /// Schema name (doubles as the forced tool name on Anthropic).
+    pub name: String,
+    /// The JSON Schema the model's reply must satisfy.
+    pub schema: serde_json::Value,
+}
+
+impl OutputSchema {
+    pub fn new(name: impl Into<String>, schema: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+        }
+    }
+}
+
+/// Tool definition sent to the LLM (schema only, no execute fn)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+use serde::{Deserialize, Serialize};
+
+/// The core provider trait. Implement this for each LLM backend.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait StreamProvider: crate::rt::MaybeSend + crate::rt::MaybeSync {
+    /// Stream a completion, sending [`StreamEvent`]s through the channel.
+    ///
+    /// On success returns the final complete assistant [`Message`].
+    /// On failure returns a [`ProviderError`] (used by retry logic to decide
+    /// whether the call is retryable).
+    ///
+    /// **Drop every clone of `tx` before returning.** The agent loop forwards
+    /// the attempt's events until the channel closes, and only then decides
+    /// whether to retry or end the turn. A sender kept alive past the return
+    /// (for example by a task spawned with a clone of `tx`) keeps that channel
+    /// open, and the loop waits on it.
+    async fn stream(
+        &self,
+        config: StreamConfig,
+        tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, ProviderError>;
+
+    /// The API protocol this provider speaks, if it maps to a single one.
+    ///
+    /// Built-in providers return `Some(_)`; the default is `None` (for test
+    /// doubles and multi-protocol adapters). Used to verify registry wiring
+    /// (a resolved provider should report the protocol it was registered for)
+    /// and to enable protocol-mismatch diagnostics.
+    fn protocol(&self) -> Option<crate::provider::ApiProtocol> {
+        None
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error("API error: {0}")]
+    Api(String),
+    #[error("Network error: {0}")]
+    Network(String),
+    #[error("Auth error: {0}")]
+    Auth(String),
+    /// Out of quota or capacity for now: retried with backoff. Carries no
+    /// message (the body is logged at `warn!` when it is classified).
+    #[error("Rate limited{}", retry_after_suffix(.retry_after_ms))]
+    RateLimited { retry_after_ms: Option<u64> },
+    #[error("Context overflow: {message}")]
+    ContextOverflow { message: String },
+    #[error("Cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Other(String),
+}
+
+/// `", retry after 1500ms"`, or nothing when the server named no delay.
+fn retry_after_suffix(ms: &Option<u64>) -> String {
+    ms.map(|ms| format!(", retry after {ms}ms"))
+        .unwrap_or_default()
+}
+
+impl ProviderError {
+    /// Classify an HTTP error response into the appropriate error variant.
+    ///
+    /// Detects context overflow, rate limits, auth errors, and general API errors
+    /// from the HTTP status code and response body.
+    pub fn classify(status: u16, message: &str) -> Self {
+        Self::classify_with_retry_after(status, message, None)
+    }
+
+    /// Like [`classify`](Self::classify), carrying a parsed `Retry-After`
+    /// value (milliseconds) into the `RateLimited` variant when present.
+    pub fn classify_with_retry_after(
+        status: u16,
+        message: &str,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        // Rate limits and overloads first: a rate-limit body can contain an overflow phrase (Azure's
+        // "exceeds the maximum usage size allowed during peak load"), and
+        // classifying it as overflow compacts the context instead of backing
+        // off.
+        //
+        // 529 (Anthropic "overloaded") and 503 ("service unavailable") mean
+        // the provider is out of capacity for now: back off and retry, like a
+        // rate limit. Other 5xx stay `Api` — a server bug that fails the same
+        // way every time should not be re-sent.
+        if matches!(status, 429 | 503 | 529) {
+            // `RateLimited` has no message: keep the server's explanation
+            // ("Overloaded", "model is loading") in the log.
+            tracing::warn!(status, body = %truncate_body(message), "provider rate-limited or overloaded; will retry");
+            Self::RateLimited { retry_after_ms }
+        } else if is_context_overflow(status, message) {
+            Self::ContextOverflow {
+                message: message.to_string(),
+            }
+        } else if status == 401 || status == 403 {
+            Self::Auth(message.to_string())
+        } else {
+            Self::Api(message.to_string())
+        }
+    }
+
+    /// Returns true if this error indicates a context overflow.
+    pub fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::ContextOverflow { .. })
+    }
+}
+
+/// Extract a classified error from a `reqwest_eventsource::Error`.
+///
+/// - `InvalidStatusCode` — reads the response body and classifies via
+///   [`ProviderError::classify()`] (context overflow, rate limit, auth, etc.).
+/// - `Transport` — maps to [`ProviderError::Network`] (retryable).
+/// - `StreamEnded` — the HTTP body ended *legally* (terminal chunk, exact
+///   `Content-Length`, or a close-framed response) but the SSE payload carried
+///   no terminator. Note this is **not** the connection-reset case: a mid-body
+///   TCP reset is a decode error and surfaces as `Transport`. Mapped to
+///   [`ProviderError::Network`] (retryable) because a gateway that returns a
+///   well-framed body with a truncated payload is usually transient.
+///
+///   Reaching this arm must mean no complete response was assembled. A provider
+///   that can finish a response before a terminator-less close is required to
+///   catch `StreamEnded` itself and break instead — otherwise a finished
+///   response gets retried and re-billed. `openai_compat` (`saw_finish_reason`)
+///   and `anthropic` (`saw_stop_reason`) do this. `openai_responses` and
+///   `azure_openai` instead break on every terminal event they can receive
+///   (`response.completed` / `.incomplete` / `.failed`), which upholds the same
+///   invariant without a flag.
+/// - All other variants (protocol/parse errors like `InvalidContentType`,
+///   `Utf8`, `Parser`, `InvalidLastEventId`) — maps to [`ProviderError::Other`]
+///   (non-retryable, fail fast).
+pub async fn classify_eventsource_error(error: reqwest_eventsource::Error) -> ProviderError {
+    match error {
+        reqwest_eventsource::Error::InvalidStatusCode(status, response) => {
+            let status_code = status.as_u16();
+            let retry_after_ms = parse_retry_after(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            ProviderError::classify_with_retry_after(
+                status_code,
+                &format!(
+                    "HTTP {} {}: {}",
+                    status_code,
+                    status.canonical_reason().unwrap_or(""),
+                    body
+                ),
+                retry_after_ms,
+            )
+        }
+        reqwest_eventsource::Error::Transport(e) => ProviderError::Network(format!("{:?}", e)),
+        reqwest_eventsource::Error::StreamEnded => ProviderError::Network(
+            "SSE body ended without a terminator and no complete response was assembled \
+             (if this repeats, the endpoint may be returning 200 with an empty or \
+             truncated body rather than an error status)"
+                .into(),
+        ),
+        other => ProviderError::Other(other.to_string()),
+    }
+}
+
+/// Parse a `Retry-After` header (seconds form) into milliseconds.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|s| *s >= 0.0)
+        .map(|secs| (secs * 1000.0) as u64)
+}
+
+/// Classify an SSE-embedded error event message into a [`ProviderError`].
+///
+/// A structured rate-limit or overload error — an `error` / `response.error`
+/// / top-level `type`, `code` or `status` such as `rate_limit_error`,
+/// `overloaded_error`, `no_capacity` or `unavailable`, or a numeric `code` of
+/// 503 / 529 — is [`ProviderError::RateLimited`], checked
+/// **before** the overflow phrases —
+/// the same order as the HTTP path, for the same reason. Otherwise the text
+/// is checked for known context-overflow patterns. Used by providers that
+/// receive `"error"` events in the SSE stream.
+pub fn classify_sse_error_event(message: &str) -> ProviderError {
+    if is_rate_limit_payload(message) {
+        tracing::warn!(payload = %truncate_body(message), "in-stream rate limit or overload; will retry");
+        ProviderError::RateLimited {
+            retry_after_ms: None,
+        }
+    } else if is_context_overflow_message(message) {
+        ProviderError::ContextOverflow {
+            message: message.to_string(),
+        }
+    } else {
+        ProviderError::Api(message.to_string())
+    }
+}
+
+/// Error `type` / `code` / `status` values that mean "rate limited or out of
+/// capacity, retry later", compared case-insensitively:
+///
+/// - `too_many_requests`, `no_capacity` — Azure OpenAI's mid-stream error
+///   (`{"type":"error","error":{"type":"too_many_requests","code":"no_capacity",
+///   "message":"… exceeds the maximum usage size allowed during peak load …"}}`)
+/// - `rate_limit_exceeded` — OpenAI's error `code`
+/// - `rate_limit_error` — Anthropic's error `type`
+/// - `overloaded_error` — Anthropic's in-stream overload (the HTTP form is 529)
+/// - `unavailable` — Google's in-stream `"status":"UNAVAILABLE"` (503)
+/// - `rate_limit` — generic
+///
+/// Google's in-stream `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}`
+/// is deliberately not listed: it stays an [`ProviderError::Api`] carrying the
+/// payload, as `google_stream_test` pins. Of numeric codes only the overloads
+/// (503, 529) are read.
+const RATE_LIMIT_CODES: &[&str] = &[
+    "too_many_requests",
+    "no_capacity",
+    "rate_limit_exceeded",
+    "rate_limit_error",
+    "overloaded_error",
+    "unavailable",
+    "rate_limit",
+];
+
+/// Whether an SSE error payload is a structured rate-limit / capacity error.
+///
+/// Looks at `type`, `code` and `status` on the nested `error` object, on
+/// `response.error` (a Responses `response.failed` event), and at the top
+/// level (a Responses `error` event carries `code` there). Only structured
+/// string fields are read — free text is not, since a message can mention a
+/// rate limit without being one.
+fn is_rate_limit_payload(message: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(message) else {
+        return false;
+    };
+    let candidates = [v.get("error"), v.pointer("/response/error"), Some(&v)];
+    let limited = candidates.into_iter().flatten().any(|e| {
+        ["type", "code", "status"]
+            .iter()
+            .any(|key| match e.get(key) {
+                Some(serde_json::Value::String(s)) => {
+                    RATE_LIMIT_CODES.contains(&s.to_ascii_lowercase().as_str())
+                }
+                // A numeric overload code (Gemini `{"code":503,…}`, OpenRouter
+                // `{"code":503|529,…}`). 429 is deliberately not read: Gemini's
+                // in-stream 429 (`RESOURCE_EXHAUSTED`) is often an exhausted
+                // quota, kept as `Api` so its message survives.
+                Some(serde_json::Value::Number(n)) if *key == "code" => {
+                    matches!(n.as_u64(), Some(503 | 529))
+                }
+                _ => false,
+            })
+    });
+    limited
+}
+
+/// A response body short enough for one log line.
+fn truncate_body(body: &str) -> String {
+    const MAX: usize = 500;
+    match body.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}… ({} bytes)", &body[..cut], body.len()),
+        None => body.to_string(),
+    }
+}
+
+/// Known phrases that indicate context overflow across LLM providers.
+///
+/// Covers: Anthropic, OpenAI, Google Gemini, AWS Bedrock, xAI, Groq,
+/// OpenRouter, llama.cpp, LM Studio, MiniMax, Kimi, GitHub Copilot,
+/// and generic patterns.
+const OVERFLOW_PHRASES: &[&str] = &[
+    "prompt is too long",         // Anthropic
+    "input is too long",          // AWS Bedrock
+    "exceeds the context window", // OpenAI (Completions & Responses)
+    // Google Gemini: "The input token count (N) exceeds the maximum number
+    // of tokens allowed (M)". Kept this specific: the bare "exceeds the
+    // maximum" also matched Azure's rate-limit text ("exceeds the maximum
+    // usage size allowed during peak load").
+    "exceeds the maximum number of tokens",
+    "maximum prompt length",              // xAI
+    "reduce the length of the messages",  // Groq
+    "maximum context length",             // OpenRouter
+    "exceeds the limit of",               // GitHub Copilot
+    "exceeds the available context size", // llama.cpp
+    "greater than the context length",    // LM Studio
+    "context window exceeds limit",       // MiniMax
+    "exceeded model token limit",         // Kimi
+    "context length exceeded",            // Generic
+    "context_length_exceeded",            // Generic (underscore variant)
+    "model_context_window_exceeded",      // Anthropic in-stream stop_reason
+    "too many tokens",                    // Generic
+    "token limit exceeded",               // Generic
+];
+
+/// Check if an error message indicates context overflow (for use by types.rs).
+pub(crate) fn is_context_overflow_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    OVERFLOW_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// How a [`ProviderError::ContextOverflow`] displays, up to its message. The
+/// loop records a failed turn's error as its `Display` text, and an overflow
+/// classified from status alone (an empty 400/413 body) carries no phrase to
+/// match, so this prefix is what identifies it.
+pub(crate) const CONTEXT_OVERFLOW_DISPLAY_PREFIX: &str = "Context overflow: ";
+
+/// Check if an HTTP error response indicates context overflow.
+fn is_context_overflow(status: u16, message: &str) -> bool {
+    // Some providers (Cerebras, Mistral) return 400/413 with empty body on overflow
+    if (status == 400 || status == 413) && message.trim().is_empty() {
+        return true;
+    }
+    is_context_overflow_message(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_retry_after(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn parse_retry_after_whole_seconds() {
+        assert_eq!(
+            parse_retry_after(&headers_with_retry_after("5")),
+            Some(5000)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_fractional_seconds() {
+        assert_eq!(
+            parse_retry_after(&headers_with_retry_after("1.5")),
+            Some(1500)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_negative() {
+        assert_eq!(parse_retry_after(&headers_with_retry_after("-1")), None);
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_http_date() {
+        // The HTTP-date form of Retry-After is not supported; must not
+        // misparse as a huge delay.
+        assert_eq!(
+            parse_retry_after(&headers_with_retry_after("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_missing_header() {
+        assert_eq!(parse_retry_after(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn classify_anthropic_overflow() {
+        let err =
+            ProviderError::classify(400, "prompt is too long: 213462 tokens > 200000 maximum");
+        assert!(err.is_context_overflow());
+    }
+
+    #[test]
+    fn classify_openai_overflow() {
+        let err =
+            ProviderError::classify(400, "Your input exceeds the context window of this model");
+        assert!(err.is_context_overflow());
+    }
+
+    #[test]
+    fn classify_google_overflow() {
+        let err = ProviderError::classify(
+            400,
+            "The input token count (1196265) exceeds the maximum number of tokens allowed",
+        );
+        assert!(err.is_context_overflow());
+    }
+
+    #[test]
+    fn classify_bedrock_overflow() {
+        let err = ProviderError::classify(400, "input is too long for requested model");
+        assert!(err.is_context_overflow());
+    }
+
+    #[test]
+    fn classify_xai_overflow() {
+        let err = ProviderError::classify(
+            400,
+            "This model's maximum prompt length is 131072 but request contains 537812 tokens",
+        );
+        assert!(err.is_context_overflow());
+    }
+
+    #[test]
+    fn classify_groq_overflow() {
+        let err = ProviderError::classify(
+            400,
+            "Please reduce the length of the messages or completion",
+        );
+        assert!(err.is_context_overflow());
+    }
+
+    #[test]
+    fn overflow_display_prefix_matches_the_error() {
+        // Message::is_context_overflow keys on this prefix; it must track the
+        // `#[error]` text of the variant.
+        let err = ProviderError::ContextOverflow {
+            message: String::new(),
+        };
+        assert_eq!(err.to_string(), CONTEXT_OVERFLOW_DISPLAY_PREFIX);
+    }
+
+    #[test]
+    fn classify_empty_body_overflow() {
+        // Cerebras/Mistral return 400/413 with empty body
+        let err = ProviderError::classify(413, "");
+        assert!(err.is_context_overflow());
+        let err = ProviderError::classify(400, "  ");
+        assert!(err.is_context_overflow());
+    }
+
+    #[test]
+    fn classify_rate_limit() {
+        let err = ProviderError::classify(429, "rate limit exceeded");
+        assert!(matches!(err, ProviderError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn classify_auth_error() {
+        let err = ProviderError::classify(401, "invalid api key");
+        assert!(matches!(err, ProviderError::Auth(_)));
+        let err = ProviderError::classify(403, "forbidden");
+        assert!(matches!(err, ProviderError::Auth(_)));
+    }
+
+    #[test]
+    fn classify_regular_api_error() {
+        let err = ProviderError::classify(400, "invalid request format");
+        assert!(matches!(err, ProviderError::Api(_)));
+        assert!(!err.is_context_overflow());
+    }
+
+    /// Azure OpenAI's mid-stream capacity error, verbatim in shape.
+    const AZURE_NO_CAPACITY: &str = r#"{"type":"error","error":{"type":"too_many_requests","code":"no_capacity","message":"The request exceeds the maximum usage size allowed during peak load. Please retry later.","param":null},"sequence_number":3}"#;
+
+    #[test]
+    fn azure_no_capacity_mid_stream_is_rate_limited_not_overflow() {
+        let err = classify_sse_error_event(AZURE_NO_CAPACITY);
+        assert!(
+            matches!(err, ProviderError::RateLimited { .. }),
+            "got {err:?}"
+        );
+        // And the text alone no longer reads as an overflow either.
+        assert!(!is_context_overflow_message(AZURE_NO_CAPACITY));
+    }
+
+    #[test]
+    fn http_429_is_rate_limited_even_with_an_overflow_phrase() {
+        // Positive control: the body does carry an overflow phrase.
+        let body = "HTTP 429: prompt is too long for current capacity";
+        assert!(is_context_overflow_message(body));
+        let err = ProviderError::classify_with_retry_after(429, body, Some(2000));
+        assert!(
+            matches!(
+                err,
+                ProviderError::RateLimited {
+                    retry_after_ms: Some(2000)
+                }
+            ),
+            "got {err:?}"
+        );
+        // Near-miss: the same body at 400 is still an overflow.
+        assert!(ProviderError::classify(400, body).is_context_overflow());
+    }
+
+    #[test]
+    fn rate_limited_reads_cleanly_with_or_without_a_delay() {
+        let without = ProviderError::RateLimited {
+            retry_after_ms: None,
+        };
+        assert_eq!(without.to_string(), "Rate limited");
+        let with = ProviderError::RateLimited {
+            retry_after_ms: Some(1500),
+        };
+        assert_eq!(with.to_string(), "Rate limited, retry after 1500ms");
+    }
+
+    #[test]
+    fn numeric_overload_codes_in_sse_errors_are_retried_429_is_not() {
+        for payload in [
+            r#"{"error":{"code":503,"message":"The model is overloaded","status":"UNAVAILABLE"}}"#,
+            r#"{"error":{"code":529,"message":"Overloaded"}}"#,
+        ] {
+            assert!(
+                classify_sse_error_event(payload).is_retryable(),
+                "{payload}"
+            );
+        }
+        let quota = classify_sse_error_event(
+            r#"{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}"#,
+        );
+        assert!(matches!(quota, ProviderError::Api(_)), "{quota:?}");
+    }
+
+    #[test]
+    fn overloaded_and_unavailable_are_retried_other_5xx_are_not() {
+        for status in [529, 503] {
+            let err = ProviderError::classify_with_retry_after(status, "Overloaded", Some(1500));
+            assert!(
+                matches!(
+                    err,
+                    ProviderError::RateLimited {
+                        retry_after_ms: Some(1500)
+                    }
+                ),
+                "{status}: {err:?}"
+            );
+            assert!(err.is_retryable());
+        }
+        for status in [500, 502, 504] {
+            let err = ProviderError::classify(status, "Internal server error");
+            assert!(matches!(err, ProviderError::Api(_)), "{status}: {err:?}");
+            assert!(!err.is_retryable());
+        }
+    }
+
+    #[test]
+    fn structured_rate_limit_codes_in_sse_errors() {
+        for payload in [
+            // OpenAI Responses `error` event: code at the top level.
+            r#"{"type":"error","code":"rate_limit_exceeded","message":"Rate limit reached","param":null}"#,
+            // Responses `response.failed`.
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"slow down"}}}"#,
+            // Anthropic mid-stream.
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your rate limit"}}"#,
+            // Anthropic overload mid-stream (529 over HTTP).
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        ] {
+            let err = classify_sse_error_event(payload);
+            assert!(
+                matches!(err, ProviderError::RateLimited { .. }),
+                "{payload}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_overflow_and_plain_errors_are_unchanged() {
+        // Overflow payloads with non-rate-limit codes still read as overflow.
+        for payload in [
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#,
+            r#"{"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}}"#,
+            r#"{"error":{"code":400,"message":"The input token count (1196265) exceeds the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}"#,
+        ] {
+            assert!(
+                classify_sse_error_event(payload).is_context_overflow(),
+                "{payload}"
+            );
+        }
+        // A message that merely mentions a rate limit is not one: only
+        // structured fields are read.
+        let err = classify_sse_error_event(
+            r#"{"type":"error","error":{"type":"api_error","message":"rate_limit config invalid"}}"#,
+        );
+        assert!(matches!(err, ProviderError::Api(_)), "{err:?}");
+        // Non-JSON text keeps the phrase path.
+        assert!(classify_sse_error_event("context_length_exceeded").is_context_overflow());
+        assert!(matches!(
+            classify_sse_error_event("internal error"),
+            ProviderError::Api(_)
+        ));
+    }
+
+    #[test]
+    fn overflow_message_case_insensitive() {
+        assert!(is_context_overflow_message("PROMPT IS TOO LONG"));
+        assert!(is_context_overflow_message("Too Many Tokens in request"));
+    }
+
+    #[test]
+    fn non_overflow_messages() {
+        assert!(!is_context_overflow_message("invalid api key"));
+        assert!(!is_context_overflow_message("internal server error"));
+        assert!(!is_context_overflow_message(""));
+    }
+
+    fn config_with(system: &str, messages: Vec<Message>) -> StreamConfig {
+        let mut c = StreamConfig::new("m", "k");
+        c.system_prompt = system.into();
+        c.messages = messages;
+        c
+    }
+
+    #[test]
+    fn session_key_is_none_when_caching_is_off() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::disabled();
+        assert!(c.cache_session_key().is_none());
+
+        c.cache_config = CacheConfig {
+            strategy: CacheStrategy::Disabled,
+            ..CacheConfig::default()
+        };
+        assert!(c.cache_session_key().is_none());
+    }
+
+    #[test]
+    fn explicit_session_key_is_returned_verbatim() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::default().with_session_key("abc");
+        assert_eq!(c.cache_session_key().as_deref(), Some("abc"));
+    }
+
+    /// The load-bearing property: appending turns must not move the key, or
+    /// every request routes to a fresh cache.
+    #[test]
+    fn derived_key_ignores_everything_after_the_first_user_message() {
+        let a = config_with("sys", vec![Message::user("first")]);
+        let b = config_with(
+            "sys",
+            vec![
+                Message::user("first"),
+                Message::user("second"),
+                Message::user("third"),
+            ],
+        );
+        assert_eq!(a.cache_session_key(), b.cache_session_key());
+        assert!(a.cache_session_key().is_some());
+    }
+
+    /// Regression: the key must survive **compaction**, not merely appending.
+    ///
+    /// The first version of this derivation mixed in the first user message.
+    /// `compact_messages` can drop the head and insert a deliberately constant
+    /// marker at index 0, so the key drifted mid-session *and* every session
+    /// sharing a system prompt collapsed onto one value — the exact
+    /// route-unrelated-sessions-together harm the empty-head guard exists to
+    /// prevent, arriving through a different door. Appending-only tests could
+    /// not see it, because they assert stability under the one condition where
+    /// the old derivation held.
+    #[test]
+    fn derived_key_survives_compaction_that_rewrites_the_head() {
+        use crate::context::{compact_messages, ContextConfig};
+
+        let cfg = ContextConfig {
+            // Small enough that the retained tail alone busts the target, which
+            // is what re-enters `keep_within_budget` and drops the head.
+            max_context_tokens: 400,
+            system_prompt_tokens: 0,
+            ..ContextConfig::default()
+        };
+
+        let conversation = |tag: &str| -> Vec<crate::types::AgentMessage> {
+            (0..80)
+                .map(|i| {
+                    crate::types::AgentMessage::Llm(Message::User {
+                        content: vec![Content::Text {
+                            text: format!("{tag} message {i} {}", "filler ".repeat(40)),
+                        }],
+                        timestamp: i as u64,
+                    })
+                })
+                .collect()
+        };
+
+        let key_of = |msgs: &[crate::types::AgentMessage]| {
+            let mut c = StreamConfig::new("m", "k");
+            c.system_prompt = "shared system prompt".into();
+            c.messages = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    crate::types::AgentMessage::Llm(l) => Some(l.clone()),
+                    _ => None,
+                })
+                .collect();
+            c.cache_session_key()
+        };
+
+        let (a, b) = (conversation("alpha"), conversation("bravo"));
+        let (a_before, b_before) = (key_of(&a), key_of(&b));
+        let (a_len, b_len) = (a.len(), b.len());
+        let (a_compacted, b_compacted) = (compact_messages(a, &cfg), compact_messages(b, &cfg));
+
+        // Without this the test passes vacuously if a future ContextConfig
+        // default stops triggering compaction at this size.
+        assert!(
+            a_compacted.len() < a_len && b_compacted.len() < b_len,
+            "precondition: compaction must actually have fired"
+        );
+        assert!(
+            matches!(
+                &a_compacted[0],
+                crate::types::AgentMessage::Llm(Message::User { content, .. })
+                    if content.iter().any(|c| matches!(
+                        c, Content::Text { text } if text == crate::context::COMPACTION_MARKER
+                    ))
+            ),
+            "precondition: the head was dropped and replaced by the marker"
+        );
+
+        let (a_after, b_after) = (key_of(&a_compacted), key_of(&b_compacted));
+        assert!(a_before.is_some(), "precondition: a key is derived at all");
+        assert_eq!(a_before, a_after, "compaction must not move the key");
+        assert_eq!(b_before, b_after, "compaction must not move the key");
+    }
+
+    #[test]
+    fn distinct_system_prompts_derive_distinct_keys() {
+        let a = config_with("sys A", vec![Message::user("same")]);
+        let b = config_with("sys B", vec![Message::user("same")]);
+        assert_ne!(a.cache_session_key(), b.cache_session_key());
+    }
+
+    /// Documents the deliberate consequence of keying on the system prompt
+    /// alone: sessions of the same agent share a key. That is the correct
+    /// grouping — they share the cached prefix — and the reason
+    /// `session_key` exists for deployments that need them apart.
+    #[test]
+    fn sessions_sharing_a_system_prompt_share_a_key_by_design() {
+        let a = config_with("same", vec![Message::user("deploy the API")]);
+        let b = config_with("same", vec![Message::user("write a poem")]);
+        assert_eq!(a.cache_session_key(), b.cache_session_key());
+
+        let mut split = config_with("same", vec![Message::user("write a poem")]);
+        split.cache_config = CacheConfig::default().with_session_key("tenant-7/session-3");
+        assert_ne!(a.cache_session_key(), split.cache_session_key());
+    }
+
+    /// Message content of every kind is outside the derivation, so a
+    /// multimodal or tool-only head cannot produce a degenerate key.
+    #[test]
+    fn non_text_content_does_not_affect_the_key() {
+        let text_only = config_with("sys", vec![Message::user("hello")]);
+        let image_only = config_with(
+            "sys",
+            vec![Message::User {
+                content: vec![Content::Image {
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
+                }],
+                timestamp: 0,
+            }],
+        );
+        assert_eq!(
+            text_only.cache_session_key(),
+            image_only.cache_session_key()
+        );
+        assert!(text_only.cache_session_key().is_some());
+    }
+
+    /// Nothing distinctive to key on — hashing the empty string would route
+    /// unrelated sessions together, which is worse than sending no key.
+    #[test]
+    fn empty_system_prompt_yields_no_key() {
+        assert!(config_with("", vec![]).cache_session_key().is_none());
+        assert!(config_with("   ", vec![Message::user("hi")])
+            .cache_session_key()
+            .is_none());
+    }
+
+    /// A blank explicit key would send `prompt_cache_key: ""`, routing every
+    /// caller who did that onto one cache — strictly worse than no key.
+    #[test]
+    fn blank_explicit_session_key_is_treated_as_unset() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::default().with_session_key("   ");
+        assert_eq!(
+            c.cache_session_key(),
+            config_with("sys", vec![]).cache_session_key(),
+            "blank key must fall through to derivation, not send an empty string"
+        );
+    }
+
+    /// `Manual` with every flag off means "cache nothing" — Anthropic honours
+    /// it by placing no breakpoints, so a key-routed provider must not read the
+    /// same value as "yes".
+    #[test]
+    fn manual_with_all_flags_off_sends_no_key() {
+        let mut c = config_with("sys", vec![Message::user("hi")]);
+        c.cache_config = CacheConfig::default().with_strategy(CacheStrategy::Manual {
+            cache_system: false,
+            cache_tools: false,
+            cache_messages: false,
+        });
+        assert!(c.cache_session_key().is_none());
+
+        // But a Manual that asks for *something* still routes.
+        c.cache_config = CacheConfig::default().with_strategy(CacheStrategy::Manual {
+            cache_system: true,
+            cache_tools: false,
+            cache_messages: false,
+        });
+        assert!(c.cache_session_key().is_some());
+    }
+
+    #[test]
+    fn a_system_prompt_alone_is_enough_to_derive_a_key() {
+        assert!(config_with("sys", vec![]).cache_session_key().is_some());
+    }
+}

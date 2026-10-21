@@ -1,0 +1,369 @@
+{
+  "schema": 1,
+  "comment": "yoagent's built-in model prices, USD per million tokens, keyed by ModelConfig::provider then ModelConfig::id (decision models: by their price provider key, e.g. 'typesafe', then the model id the API reports). A cache rate of 0 (or omitted) bills at the band's input rate. Rates are a snapshot checked against each 'source' on its 'verified' date, not an authority; tests/price_audit.rs diffs every entry against models.dev. See docs/concepts/pricing.md.",
+  "providers": {
+    "anthropic": {
+      "claude-fable-5": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-08-19"
+      },
+      "claude-fable-5-1": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 0.25,
+        "cache_write": 12.5,
+        "note": "Cache hits bill at 0.025x input ($0.25), not Fable 5's 0.1x. cache_write is the 5-minute rate; the 1-hour rate ($20) is not modelled because yoagent places only 5-minute breakpoints. Verified against the raw page markup.",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-09-24"
+      },
+      "claude-haiku-4-5": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.1,
+        "cache_write": 1.25,
+        "note": "Flat: the 200K window is below any long-context band.",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-08-19"
+      },
+      "claude-opus-4-8": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-08-19"
+      },
+      "claude-opus-5": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-08-19"
+      },
+      "claude-opus-5-5": {
+        "input": 4.0,
+        "output": 20.0,
+        "cache_read": 0.2,
+        "cache_write": 5.0,
+        "note": "Cache hits bill at 0.05x input ($0.20), not the usual 0.1x. cache_write is the 5-minute rate; the 1-hour rate ($8) is not modelled because yoagent places only 5-minute breakpoints. Verified against the raw page markup.",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-09-25"
+      },
+      "claude-sonnet-5": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.2,
+        "cache_write": 2.5,
+        "note": "Shipped Sonnet 4.6's $3/$15 from v0.9.0 through v0.16.5; these are Sonnet 5's own rates.",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-08-19"
+      },
+      "claude-sonnet-5-5": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.1,
+        "cache_write": 2.5,
+        "note": "5-minute cache write; the 1-hour write is $4.00. No long-context tier: the full 1M bills at these rates.",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-10-18"
+      },
+      "claude-haiku-5-5": {
+        "input": 0.1,
+        "output": 0.5,
+        "cache_read": 0.01,
+        "cache_write": 0.125,
+        "tiers": [
+          {
+            "above_prompt_tokens": 100000,
+            "input": 0.5,
+            "output": 2.5,
+            "cache_read": 0.05,
+            "cache_write": 0.625
+          }
+        ],
+        "note": "Prompts over 100,000 tokens (input + cache reads + cache writes) bill the whole request at the second rates. 5-minute cache write; the 1-hour write is $0.20 / $1.00.",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "verified": "2026-10-18"
+      }
+    },
+    "deepseek": {
+        "deepseek-flash": {
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.006,
+            "cache_write": 0.3,
+            "cache_write_at_input": true,
+            "note": "Peak rate. DeepSeek bills half of it off-peak: all hours but 01:00-04:00 and 06:00-10:00 UTC on weekdays (about 79% of the week). A flat CostConfig has no time of day, so the peak rate is the upper bound: costs are over-stated off-peak, never under-stated, and a Budget stops early rather than late.",
+            "source": "https://api-docs.deepseek.com/quick_start/pricing",
+            "verified": "2026-10-16"
+        },
+        "deepseek-v4-flash": {
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.006,
+            "cache_write": 0.3,
+            "cache_write_at_input": true,
+            "note": "The legacy name: served by DeepSeek-V4.1-Flash and billed at the deepseek-flash price. Peak rate. DeepSeek bills half of it off-peak: all hours but 01:00-04:00 and 06:00-10:00 UTC on weekdays (about 79% of the week). A flat CostConfig has no time of day, so the peak rate is the upper bound: costs are over-stated off-peak, never under-stated, and a Budget stops early rather than late.",
+            "source": "https://api-docs.deepseek.com/quick_start/pricing",
+            "verified": "2026-10-16"
+        },
+        "deepseek-v4-flash-vision-exp": {
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.006,
+            "cache_write": 0.3,
+            "cache_write_at_input": true,
+            "note": "The legacy name of a retired vision experiment: served by DeepSeek-V4.1-Flash-1017 (deepseek-flash, which takes images) and billed at the deepseek-flash price. Peak rate. DeepSeek bills half of it off-peak: all hours but 01:00-04:00 and 06:00-10:00 UTC on weekdays (about 79% of the week). A flat CostConfig has no time of day, so the peak rate is the upper bound: costs are over-stated off-peak, never under-stated, and a Budget stops early rather than late.",
+            "source": "https://api-docs.deepseek.com/quick_start/pricing",
+            "verified": "2026-10-18"
+        },
+        "deepseek-v4-pro": {
+            "input": 1.32,
+            "output": 3.96,
+            "cache_read": 0.044,
+            "cache_write": 1.32,
+            "cache_write_at_input": true,
+            "note": "Peak rate. DeepSeek bills half of it off-peak: all hours but 01:00-04:00 and 06:00-10:00 UTC on weekdays (about 79% of the week). A flat CostConfig has no time of day, so the peak rate is the upper bound: costs are over-stated off-peak, never under-stated, and a Budget stops early rather than late.",
+            "source": "https://api-docs.deepseek.com/quick_start/pricing",
+            "verified": "2026-10-16"
+        }
+    },
+    "meta": {
+      "muse-spark-1.1": {
+        "input": 1.25,
+        "output": 4.25,
+        "cache_read": 0.15,
+        "cache_write": 1.25,
+        "cache_write_at_input": true,
+        "note": "Meta charges no cache-write premium, so writes bill at the $1.25 input rate; models.dev omits cache_write for Muse Spark. No long-context premium. The contributor tier (muse-spark-*-contributor) is priced far lower and is deliberately not listed here.",
+        "source": "https://dev.meta.ai/docs/pricing-rate-limits",
+        "verified": "2026-08-19"
+      },
+      "muse-spark-1.2": {
+        "input": 1.25,
+        "output": 4.25,
+        "cache_read": 0.15,
+        "cache_write": 1.25,
+        "cache_write_at_input": true,
+        "note": "Meta charges no cache-write premium, so writes bill at the $1.25 input rate; models.dev omits cache_write for Muse Spark. No long-context premium. The contributor tier (muse-spark-*-contributor) is priced far lower and is deliberately not listed here.",
+        "source": "https://dev.meta.ai/docs/pricing-rate-limits",
+        "verified": "2026-08-19"
+      }
+    },
+    "openai": {
+      "gpt-5.5": {
+        "input": 5.0,
+        "output": 30.0,
+        "cache_read": 0.5,
+        "cache_write": 5.0,
+        "tiers": [
+          {
+            "above_prompt_tokens": 272000,
+            "input": 10.0,
+            "output": 45.0,
+            "cache_read": 1.0,
+            "cache_write": 10.0
+          }
+        ],
+        "cache_write_at_input": true,
+        "note": "The >272K cache_read ($1.00) is UNVERIFIED. The model page says only that \"prompts with >272K input tokens are priced at 2x input and 1.5x output for the full session\" - it names no cache rate, and the pricing page no longer lists gpt-5.5. $1.00 (2x, as the GPT-6 pages state for their cache rates) matches models.dev; the literal reading would keep $0.50. Input $10 and output $45 are stated. OpenAI charges no cache-write premium before GPT-5.6, so cache writes bill at the input rate ($5, $10 above 272K); models.dev omits cache_write for it.",
+        "source": "https://developers.openai.com/api/docs/models/gpt-5.5",
+        "verified": "2026-09-25"
+      },
+      "gpt-6-astra": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+        "tiers": [
+          {
+            "above_prompt_tokens": 272000,
+            "input": 20.0,
+            "output": 75.0,
+            "cache_read": 2.0,
+            "cache_write": 25.0
+          }
+        ],
+        "source": "https://developers.openai.com/api/docs/pricing",
+        "verified": "2026-09-25"
+      },
+      "gpt-6-luna": {
+        "input": 0.1,
+        "output": 0.5,
+        "cache_read": 0.01,
+        "cache_write": 0.125,
+        "tiers": [
+          {
+            "above_prompt_tokens": 272000,
+            "input": 0.2,
+            "output": 0.75,
+            "cache_read": 0.02,
+            "cache_write": 0.25
+          }
+        ],
+        "source": "https://developers.openai.com/api/docs/pricing",
+        "verified": "2026-09-25"
+      },
+      "gpt-6-sol": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.2,
+        "cache_write": 2.5,
+        "tiers": [
+          {
+            "above_prompt_tokens": 272000,
+            "input": 4.0,
+            "output": 15.0,
+            "cache_read": 0.4,
+            "cache_write": 5.0
+          }
+        ],
+        "source": "https://developers.openai.com/api/docs/pricing",
+        "verified": "2026-09-25"
+      },
+      "gpt-6.1-sol": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.1,
+        "cache_write": 2.5,
+        "tiers": [
+          {
+            "above_prompt_tokens": 272000,
+            "input": 4.0,
+            "output": 15.0,
+            "cache_read": 0.2,
+            "cache_write": 5.0
+          }
+        ],
+        "source": "https://developers.openai.com/api/docs/pricing",
+        "verified": "2026-10-18"
+      }
+    },
+    "google": {
+      "gemini-3.8-flash": {
+        "input": 1.5,
+        "output": 7.5,
+        "cache_read": 0.15,
+        "note": "Regular price. Google bills an introductory $0.75 / $3.75 / $0.075 through 2026-12-31: until then costs read twice the bill (an upper bound, so a Budget stops early, never late). Context-cache storage ($1.00 per 1M tokens per hour) is not modelled.",
+        "source": "https://ai.google.dev/gemini-api/docs/pricing",
+        "verified": "2026-10-18"
+      },
+      "gemini-4-argon": {
+        "input": 4.0,
+        "output": 20.0,
+        "cache_read": 0.2,
+        "note": "Regular price. Google bills an introductory $2 / $10 / $0.10 through 2026-11-30: until then costs read twice the bill (an upper bound, so a Budget stops early, never late). No context tier.",
+        "source": "https://ai.google.dev/gemini-api/docs/pricing",
+        "verified": "2026-10-18"
+      }
+    },
+    "mistral": {
+      "mistral-large-4": {
+        "input": 1.36,
+        "output": 4.18,
+        "cache_read": 0.14,
+        "note": "Regular price. Mistral's launch sale (50% off for two weeks from 2026-10-06) bills half of it until about 2026-10-20.",
+        "source": "https://docs.mistral.ai/models/mistral-large-4-0",
+        "verified": "2026-10-18"
+      }
+    },
+    "qwen": {
+      "qwen3.8-flash": {
+        "input": 0.15,
+        "output": 0.47,
+        "cache_read": 0.016,
+        "cache_write": 0.2,
+        "note": "International (Singapore) deployment, the endpoint ModelConfig::qwen uses; the Global and Beijing scopes bill less.",
+        "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        "verified": "2026-10-18"
+      },
+      "qwen3.8-max": {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.25,
+        "cache_write": 2.5,
+        "note": "International (Singapore) deployment, the endpoint ModelConfig::qwen uses. cache_read is the implicit-cache rate; an explicit-cache read bills $0.17. The Global and Beijing scopes bill less.",
+        "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        "verified": "2026-10-18"
+      }
+    },
+    "xai": {
+      "grok-4.7": {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.5,
+        "tiers": [
+          {
+            "above_prompt_tokens": 200000,
+            "input": 4.0,
+            "output": 12.0,
+            "cache_read": 1.0
+          }
+        ],
+        "note": "Prompts of 200,000 tokens or more bill the whole request at the second rates (this table's threshold is exclusive, so it costs a prompt of exactly 200,000 tokens at the lower rate, under-counting it; xAI bills it at the higher one). The US-region endpoint bills 10% more.",
+        "source": "https://docs.x.ai/docs/models",
+        "verified": "2026-10-18"
+      }
+    },
+    "zai": {
+      "glm-5.3": {
+        "input": 1.4,
+        "output": 4.4,
+        "cache_read": 0.26,
+        "note": "Cache storage is free for a limited time.",
+        "source": "https://docs.z.ai/guides/overview/pricing",
+        "verified": "2026-10-18"
+      },
+      "glm-5.3-flash": {
+        "input": 0.15,
+        "output": 0.5,
+        "cache_read": 0.03,
+        "source": "https://docs.z.ai/guides/overview/pricing",
+        "verified": "2026-10-18"
+      }
+    },
+    "cloudflare": {
+      "clef": {
+        "input": 0.24,
+        "output": 0.0,
+        "note": "A decision model (feature `decision`), not a ModelConfig: DecisionModel::clef() prices each evaluation by its model id while requests go to Cloudflare's REST API (yoagent-workers' binding presets use the same rate). Workers AI lists a unit price for input tokens only; output is not listed and is recorded as 0.",
+        "source": "https://developers.cloudflare.com/workers-ai/models/clef/",
+        "verified": "2026-10-03",
+        "absent_upstream": "models.dev lists no Clef model; checked 2026-10-03"
+      },
+      "clef-flash": {
+        "input": 0.09,
+        "output": 0.0,
+        "note": "A decision model (feature `decision`): DecisionModel::clef_flash(). Workers AI lists a unit price for input tokens only; output is not listed and is recorded as 0.",
+        "source": "https://developers.cloudflare.com/workers-ai/models/clef-flash/",
+        "verified": "2026-10-03",
+        "absent_upstream": "models.dev lists no Clef model; checked 2026-10-03"
+      }
+    },
+    "openai-decisions": {
+      "gpt-6-luna": {
+        "input": 0.1,
+        "output": 0.0,
+        "note": "A decision model (feature `decision`), not a ModelConfig: DecisionModel::gpt_6_luna() prices each evaluation on OpenAI's Decisions API (POST /v1/decisions) by the model id the response reports, while requests go to api.openai.com. Distinct from chat gpt-6-luna pricing (provider `openai`). Billed per input token, cached input included; no cache-read, cache-write or output charges. Regional-processing and long-context multipliers are not modelled.",
+        "source": "https://developers.openai.com/api/docs/guides/decisions",
+        "verified": "2026-10-07",
+        "absent_upstream": "models.dev lists no Decisions API pricing (its openai entries are chat rates); checked 2026-10-07"
+      }
+    },
+    "typesafe": {
+      "jev-1.13.0": {
+        "input": 0.042,
+        "output": 0.0,
+        "note": "A decision model (feature `decision`), not a ModelConfig: DecisionModel::jev() prices each evaluation by the versioned id the API reports. Billed per input token; output tokens are free ($42 per billion input tokens).",
+        "source": "https://docs.typesafe.ai/models",
+        "verified": "2026-09-26",
+        "absent_upstream": "models.dev lists no TypeSafe provider and no Jev model; checked 2026-09-26"
+      }
+    }
+  }
+}

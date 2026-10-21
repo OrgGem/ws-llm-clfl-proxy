@@ -1,0 +1,421 @@
+//! Bash tool — execute shell commands with timeout and output capture.
+//!
+//! # This is not a sandbox
+//!
+//! `BashTool` runs whatever the model asks through `bash -c`, with the
+//! process's own environment and filesystem access. [`deny_patterns`] is a
+//! substring check that catches *typos and obvious mistakes* — it is trivially
+//! bypassed by any command that means to (`rm  -rf /` with two spaces, a
+//! base64-decoded pipe, an equivalent `find -delete`). Treat it as a guardrail,
+//! never as a security boundary.
+//!
+//! Real isolation belongs outside this tool: run the agent in a container or
+//! VM, or gate every call through
+//! [`ToolMiddleware`], which sees the arguments
+//! before execution and can deny them. For credentials specifically, see
+//! [`BashTool::env_allowlist`].
+//!
+//! [`deny_patterns`]: BashTool::deny_patterns
+
+use crate::types::*;
+
+/// Type alias for command confirmation callback.
+pub type ConfirmFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
+use async_trait::async_trait;
+use std::time::Duration;
+use tokio::process::Command;
+
+/// How long the output is still read after `bash` exits, for what is
+/// buffered in the pipes: past it, a background job that holds them is left
+/// running, its later output discarded, and the result says so.
+const READ_GRACE: Duration = Duration::from_secs(1);
+
+/// Execute shell commands. Captures stdout + stderr.
+pub struct BashTool {
+    /// Working directory for commands
+    pub cwd: Option<String>,
+    /// Max execution time per command
+    pub timeout: Duration,
+    /// Max bytes captured from each of stdout and stderr. Reading stops
+    /// keeping bytes past this (the rest is drained and discarded), so memory
+    /// stays bounded however much a command prints.
+    pub max_output_bytes: usize,
+    /// Substrings that block a command outright.
+    ///
+    /// A convenience guardrail against typos, **not** a security control: a
+    /// substring match is bypassed by whitespace, quoting, or encoding. See
+    /// the module docs.
+    pub deny_patterns: Vec<String>,
+    /// When set, the child process receives only these environment variables
+    /// (plus `PATH`, `HOME`, `PWD` if present).
+    ///
+    /// Commands otherwise inherit the agent's whole environment, including
+    /// any `*_API_KEY` the process holds — so a model-authored command can
+    /// read them. An allowlist is the cheap mitigation when running commands
+    /// the model composed.
+    pub env_allowlist: Option<Vec<String>>,
+    /// Optional callback for confirming dangerous commands
+    pub confirm_fn: Option<ConfirmFn>,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            timeout: Duration::from_secs(120),
+            max_output_bytes: 256 * 1024, // 256KB
+            deny_patterns: vec![
+                "rm -rf /".into(),
+                "rm -rf /*".into(),
+                "mkfs".into(),
+                "dd if=".into(),
+                ":(){:|:&};:".into(), // fork bomb
+            ],
+            confirm_fn: None,
+            env_allowlist: None,
+        }
+    }
+}
+
+impl BashTool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Pass only these environment variables to commands (plus `PATH`,
+    /// `HOME`, `PWD`). Use when the model composes the command.
+    pub fn with_env_allowlist(mut self, vars: Vec<String>) -> Self {
+        self.env_allowlist = Some(vars);
+        self
+    }
+
+    pub fn with_deny_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.deny_patterns = patterns;
+        self
+    }
+
+    pub fn with_confirm(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.confirm_fn = Some(Box::new(f));
+        self
+    }
+}
+
+#[async_trait]
+impl AgentTool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn label(&self) -> &str {
+        "Execute Command"
+    }
+
+    fn description(&self) -> &str {
+        "Execute a bash command and return stdout/stderr. Use for running scripts, installing packages, checking system state, etc."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to execute"
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let cancel = ctx.cancel;
+        let command = params["command"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidArgs("missing 'command' parameter".into()))?;
+
+        // Guardrail only — see the module docs; this is not a security boundary.
+        for pattern in &self.deny_patterns {
+            if command.contains(pattern.as_str()) {
+                return Err(ToolError::Failed(format!(
+                    "Command blocked by safety policy: contains '{}'. This pattern is denied for safety.",
+                    pattern
+                )));
+            }
+        }
+
+        // Check confirmation callback
+        if let Some(ref confirm) = self.confirm_fn {
+            if !confirm(command) {
+                return Err(ToolError::Failed(
+                    "Command was not confirmed by the user.".into(),
+                ));
+            }
+        }
+
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cmd = std::process::Command::new("bash");
+        // std's `process_group` (Rust 1.64): tokio's own needs tokio 1.40,
+        // newer than the `tokio = "1"` this crate asks for.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut cmd = Command::from(cmd);
+        cmd.arg("-c").arg(command);
+
+        // Keep credentials out of model-authored commands when configured.
+        if let Some(ref allow) = self.env_allowlist {
+            let keep: Vec<(String, String)> = std::env::vars()
+                .filter(|(k, _)| {
+                    allow.iter().any(|a| a == k) || matches!(k.as_str(), "PATH" | "HOME" | "PWD")
+                })
+                .collect();
+            cmd.env_clear();
+            for (k, v) in keep {
+                cmd.env(k, v);
+            }
+        }
+
+        if let Some(ref cwd) = self.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        // No stdin: a command that reads input gets EOF at once instead of
+        // the agent's terminal (`spawn` inherits stdin; `output` did not).
+        cmd.stdin(std::process::Stdio::null());
+        // Capture output
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        // A timeout or cancel must not leave the command running. On Unix
+        // `bash` leads its own process group and `GroupKill` kills the whole
+        // group: non-interactive bash has no job control, so pipeline stages,
+        // `;` / `&&` lists and background jobs stay in it. Only a process that
+        // starts its own session (`setsid`) escapes. Elsewhere this kills the
+        // `bash` process only.
+        cmd.kill_on_drop(true);
+
+        let timeout = self.timeout;
+        let max_bytes = self.max_output_bytes;
+
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolError::Failed(format!("Failed to execute: {}", e)))?;
+        // Declared after `child`, so it is dropped first: the group is killed
+        // while `bash` is not yet reaped, and its id cannot have been reused.
+        let mut group = GroupKill::new(child.id());
+        let (Some(mut child_out), Some(mut child_err)) = (child.stdout.take(), child.stderr.take())
+        else {
+            return Err(ToolError::Failed("Failed to capture output".into()));
+        };
+
+        // The captures live outside the race, so a timeout still has what the
+        // command printed before it, and whether it was cut.
+        let mut out = Capture::default();
+        let mut err = Capture::default();
+        // Set once `bash` has exited, so a timeout or cancel that fires during
+        // the read grace still sees a finished command (a cancel is still
+        // reported, but leaves the command's jobs running).
+        let mut exited = None;
+        let outcome = {
+            // Wait for `bash` itself, not for the pipes: a background job
+            // inherits them, and one still running would keep them open until
+            // the timeout. Once `bash` exits, what is buffered is read for
+            // `READ_GRACE`; whether both pipes reached their end is returned.
+            let run = async {
+                let reads = async {
+                    tokio::join!(
+                        out.read(&mut child_out, max_bytes),
+                        err.read(&mut child_err, max_bytes),
+                    );
+                };
+                tokio::pin!(reads);
+                let mut drained = false;
+                exited = Some(tokio::select! {
+                    () = &mut reads => {
+                        drained = true;
+                        child.wait().await
+                    }
+                    status = child.wait() => status,
+                });
+                drained || tokio::time::timeout(READ_GRACE, &mut reads).await.is_ok()
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => None,
+                _ = tokio::time::sleep(timeout) => Some(None),
+                drained = run => Some(Some(drained)),
+            }
+        };
+        let cancelled = outcome.is_none();
+        let drained = match (outcome, &exited) {
+            (None, None) => return Err(ToolError::Cancelled),
+            // The timeout fired before `bash` exited.
+            (Some(None), None) => {
+                let _ = child.start_kill();
+                return Err(ToolError::Failed(format!(
+                    "Command timed out after {}s. Output so far:\n{}",
+                    timeout.as_secs(),
+                    render_output(&out, &err)
+                )));
+            }
+            (Some(Some(drained)), _) => drained,
+            // A timeout or cancel during the read grace: `bash` had finished.
+            (_, Some(_)) => false,
+        };
+        let status = exited
+            .expect("`bash` has exited")
+            .map_err(|e| ToolError::Failed(format!("Failed to execute: {}", e)))?;
+        // Finished on its own: what it left running in the background (a
+        // server it started, say) is the command's business. (A cancel
+        // during the grace still leaves it: `bash` is reaped, so its group id
+        // is no longer ours to signal.)
+        group.disarm();
+        if !drained {
+            // Keep reading what such a job prints, and discard it: closing
+            // the pipes under it would kill it with SIGPIPE at its next write.
+            // The task ends when the job closes them (it exits).
+            tokio::spawn(async move {
+                let (mut sink_out, mut sink_err) = (tokio::io::sink(), tokio::io::sink());
+                let _ = tokio::join!(
+                    tokio::io::copy(&mut child_out, &mut sink_out),
+                    tokio::io::copy(&mut child_err, &mut sink_err),
+                );
+            });
+        }
+        if cancelled {
+            return Err(ToolError::Cancelled);
+        }
+        let exit_code = status.code().unwrap_or(-1);
+        let mut output = format!("Exit code: {}\n{}", exit_code, render_output(&out, &err));
+        if !drained {
+            output.push_str(
+                "\n\nNOTE: a background process still holds the command's output and was \
+                 left running; what it prints from now on is discarded.",
+            );
+        }
+
+        // Return output even on failure — LLMs need error output to self-correct
+        Ok(ToolResult {
+            content: vec![Content::Text { text: output }],
+            details: serde_json::json!({
+                "exit_code": exit_code,
+                "success": exit_code == 0,
+                "output_still_open": !drained,
+            }),
+        })
+    }
+}
+
+/// Kills the command's process group when dropped — on a timeout, a cancel,
+/// or the tool's future being dropped — unless the command finished first.
+struct GroupKill {
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
+}
+
+impl GroupKill {
+    fn new(pid: Option<u32>) -> Self {
+        #[cfg(not(unix))]
+        let _ = pid;
+        Self {
+            #[cfg(unix)]
+            pgid: pid.and_then(|p| libc::pid_t::try_from(p).ok()),
+        }
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pgid = None;
+        }
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: `killpg` takes two integers and touches no memory of
+            // ours; a failure (the group already gone) is fine to ignore.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// One output stream: the bytes kept, whether more were discarded, and a
+/// read error if the stream ended on one.
+#[derive(Default)]
+struct Capture {
+    bytes: Vec<u8>,
+    cut: bool,
+    read_error: Option<String>,
+}
+
+impl Capture {
+    /// Read `from` to the end, keeping at most `cap` bytes; the rest is
+    /// drained and discarded so the child never blocks on a full pipe.
+    async fn read<R>(&mut self, mut from: R, cap: usize)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match from.read(&mut chunk).await {
+                Ok(0) => return,
+                Err(e) => {
+                    self.read_error = Some(e.to_string());
+                    return;
+                }
+                Ok(n) => {
+                    let room = cap.saturating_sub(self.bytes.len());
+                    self.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                    self.cut |= n > room;
+                }
+            }
+        }
+    }
+
+    /// The text, with a note when bytes were discarded or reading failed.
+    /// Bytes are cut before decoding, so a multi-byte character split by the
+    /// cap becomes U+FFFD, never a panic.
+    fn text(&self) -> String {
+        let mut s = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.cut {
+            s.push_str("\n... (output truncated)");
+        }
+        if let Some(e) = &self.read_error {
+            s.push_str(&format!("\n... (output incomplete: read error: {e})"));
+        }
+        s
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty() && !self.cut && self.read_error.is_none()
+    }
+}
+
+/// Stdout alone, or both streams labelled.
+fn render_output(out: &Capture, err: &Capture) -> String {
+    if err.is_empty() {
+        out.text()
+    } else {
+        format!("STDOUT:\n{}\nSTDERR:\n{}", out.text(), err.text())
+    }
+}

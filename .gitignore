@@ -1,9 +1,13 @@
 node_modules/
+target/
+.agent-state/
+/vendor/yoagent/memory/
 dist/
 coverage/
 .wrangler/
 .local/
 credentials/
+private/
 *.local
 .dev.vars
 .dev.vars.*

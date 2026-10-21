@@ -1,0 +1,11 @@
+{
+  "memory": {
+    "backend": "ollama",
+    "model": "nomic-embed-text",
+    "base_url": "http://127.0.0.1:11434",
+    "api_key": "",
+    "dims": 768,
+    "endpoint_path": "",
+    "db_path": ".agent-state/yoagent/project-one"
+  }
+}
