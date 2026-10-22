@@ -57,4 +57,4 @@ The npm smoke requires `npm ci` and Cargo on PATH. It builds the binary and runs
 - The model receives no tools by default. Memory tools are scoped operationally by a private store dedicated to one project/agent; they do not grant server-side model permissions.
 - No real provider generation or external embedding call is implied by local compilation or fixture tests. Check [implementation status](IMPLEMENTATION-STATUS.md) for live evidence and remaining gates.
 
-For the compact runtime scope, see [ADR 0008](decisions/0008-compact-agent-directory.md). For the direct WSS design and credential boundary, see [ADR 0007](decisions/0007-yoagent-direct-ws.md), [WebSocket protocol](PROTOCOL.md), and [the threat model](THREAT-MODEL.md).
+For the compact runtime scope, see [ADR 0008](decisions/0008-compact-agent-directory.md). For the direct WSS design and credential boundary, see [ADR 0007](decisions/0007-agent-direct-ws.md), [WebSocket protocol](PROTOCOL.md), and [the threat model](THREAT-MODEL.md).

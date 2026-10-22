@@ -13,4 +13,4 @@ cargo test --manifest-path agent/Cargo.toml --package agent --features memory
 cargo clippy --manifest-path agent/Cargo.toml --package agent --all-targets --all-features -- -D warnings
 ```
 
-The runner and fixture smoke are documented in [`agent/README.md`](../README.md) and [`docs/YOAGENT.md`](../../docs/YOAGENT.md). This trimmed crate does not claim to pass the original upstream all-target suite.
+The runner and fixture smoke are documented in [`agent/README.md`](../README.md) and [`docs/AGENT.md`](../../docs/AGENT.md). This trimmed crate does not claim to pass the original upstream all-target suite.

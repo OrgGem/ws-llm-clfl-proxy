@@ -5,7 +5,7 @@ Hai Cloudflare Worker và một local adapter để ứng dụng OpenAI-compatib
 - **Identity & Config**: đăng nhập OIDC, allowlist, user/project/client, quyền provider/model, token ngắn hạn và credential envelope.
 - **LLM Socket Gateway**: WSS có xác thực, kiểm tra quyền qua private Service Binding, upstream allowlist và streaming có ACK.
 - **Local Adapter 0.5.0**: CLI và HTTP loopback OpenAI-compatible → WSS → SSE; hỗ trợ Chat Completions, Responses và legacy Completions, cả stream và JSON; có chế độ request qua môi trường dành cho agent.
-- **Native Agent**: CLI Rust và runtime YoAgent rút gọn cùng nằm trong [`agent/`](agent/README.md), giữ Agent loop và memory Uteke; provider mới kết nối trực tiếp Gateway WSS. Xem [hướng dẫn yoagent](docs/YOAGENT.md).
+- **Native Agent**: CLI Rust và runtime YoAgent rút gọn cùng nằm trong [`agent/`](agent/README.md), giữ Agent loop và memory Uteke; provider mới kết nối trực tiếp Gateway WSS. Xem [hướng dẫn yoagent](docs/AGENT.md).
 
 MVP dùng API key mã hoá AES-256-GCM; D1 giữ metadata/trạng thái revoke. OAuth ChatGPT được quản lý tại local adapter, với UI cloud điều khiển qua bridge ghép nối có xác nhận; cloud inference vẫn tắt đến khi xác minh điều kiện tích hợp. OAuth Claude chưa được hỗ trợ. Login OIDC của hệ thống không cấp quyền dùng subscription LLM. Xem [hướng dẫn OAuth](docs/OAUTH.md).
 
@@ -31,7 +31,7 @@ Hướng dẫn cấu hình/deploy và giới hạn bằng chứng: [OPERATIONS](
 - [WebSocket protocol v1](docs/PROTOCOL.md)
 - [Threat model](docs/THREAT-MODEL.md)
 - [Hướng dẫn agent client và CLI](docs/AGENT-CLIENT.md) · [Template có thể sao chép](templates/ws-llm-agent/README.md) · [Skill dùng CLI](.agents/skills/ws-llm-cli/SKILL.md)
-- [Native agent và memory](docs/YOAGENT.md) · [Nguồn runtime được giữ lại](agent/runtime/UPSTREAM.md)
+- [Native agent và memory](docs/AGENT.md) · [Nguồn runtime được giữ lại](agent/runtime/UPSTREAM.md)
 
 Kết quả kiểm thử hiện tại và giới hạn bằng chứng được ghi tại [Implementation Status](docs/IMPLEMENTATION-STATUS.md). UI staging tại https://llm.gemslab.id.vn/ui; Gateway là `wss://llm.gemslab.id.vn/v1/socket`.
 

@@ -4,7 +4,7 @@ Native Rust runner with a trimmed YoAgent runtime under `runtime/`. The `Gateway
 
 This directory contains the Cargo workspace/lockfile, CLI and WS transport (`src/`), required loop/context/memory code (`runtime/`), environment and memory examples, fixture tests and the CLI skill (`.agents/skills/ws-agent/`). The runtime is an internal library, not another executable.
 
-See [`docs/YOAGENT.md`](../docs/YOAGENT.md) for limits, memory boundaries, and protocol details. From the repository root, copy the environment template, replace its placeholders, and protect both it and the exported envelope:
+See [`docs/AGENT.md`](../docs/AGENT.md) for limits, memory boundaries, and protocol details. From the repository root, copy the environment template, replace its placeholders, and protect both it and the exported envelope:
 
 ```sh
 cp agent/.env.example .env
