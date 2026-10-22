@@ -1,5 +1,5 @@
 ---
-name: ws-yoagent
+name: ws-agent
 description: Run the trimmed YoAgent runtime through the authenticated WSS Gateway for a bounded task, inspect its response, or diagnose an incomplete run.
 ---
 

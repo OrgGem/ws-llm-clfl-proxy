@@ -2,7 +2,7 @@
 
 Native Rust runner with a trimmed YoAgent runtime under `runtime/`. The `GatewayProvider` routes model calls directly over the authenticated WSS Gateway; it does not run a separate HTTP service.
 
-This directory contains the Cargo workspace/lockfile, CLI and WS transport (`src/`), required loop/context/memory code (`runtime/`), environment and memory examples, fixture tests and the CLI skill (`.agents/skills/ws-yoagent/`). The runtime is an internal library, not another executable.
+This directory contains the Cargo workspace/lockfile, CLI and WS transport (`src/`), required loop/context/memory code (`runtime/`), environment and memory examples, fixture tests and the CLI skill (`.agents/skills/ws-agent/`). The runtime is an internal library, not another executable.
 
 See [`docs/YOAGENT.md`](../docs/YOAGENT.md) for limits, memory boundaries, and protocol details. From the repository root, copy the environment template, replace its placeholders, and protect both it and the exported envelope:
 
