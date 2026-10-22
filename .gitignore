@@ -1,7 +1,7 @@
 node_modules/
 target/
 .agent-state/
-/vendor/yoagent/memory/
+/agent/runtime/memory/
 dist/
 coverage/
 .wrangler/

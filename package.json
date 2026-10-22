@@ -11,7 +11,7 @@
     "node": ">=22.13.1"
   },
   "scripts": {
-    "test:agent:native": "cargo build --package ws-llm-agent --features memory && node scripts/test-native-agent.mjs",
+    "test:agent:native": "cargo build --manifest-path agent/Cargo.toml --package ws-llm-agent --features memory && node agent/tests/smoke.mjs",
     "build:shared": "npm run build --workspace @ws-proxy/shared",
     "build:ui": "node --check apps/identity/public/app.js && node --check apps/identity/public/api.js && node --check apps/identity/public/bootstrap.js && node --check apps/identity/public/dates.js",
     "build": "npm run build:shared && npm run build:ui && npm run build --workspaces --if-present",

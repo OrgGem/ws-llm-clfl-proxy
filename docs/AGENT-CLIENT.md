@@ -2,7 +2,7 @@
 
 The adapter CLI can run a bounded OpenAI-compatible request through the authenticated Gateway. The `request` command starts a short-lived loopback adapter inside that process, so a persistent `serve` daemon is not required. The copyable client is in [`templates/ws-llm-agent`](../templates/ws-llm-agent/README.md).
 
-For the native Rust YoAgent runtime—which preserves YoAgent's agent loop and optional local Uteke memory while using a direct WSS provider—see the [YoAgent integration guide](YOAGENT.md) and its [agent skill](../.agents/skills/ws-yoagent/SKILL.md).
+For the native Rust runner—which keeps the CLI, trimmed YoAgent runtime, and optional local Uteke memory together under [`agent/`](../agent/README.md) while using a direct WSS provider—see the [YoAgent integration guide](YOAGENT.md) and its [agent skill](../agent/.agents/skills/ws-yoagent/SKILL.md).
 
 ## Install
 

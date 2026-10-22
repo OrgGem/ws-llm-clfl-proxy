@@ -1,6 +1,6 @@
 # ADR 0007 — Preserve yoagent with a native Gateway provider
 
-2026-10-21. Accepted for the owner's request to import their agent and memory design from `trlongvn/yoagent`.
+2026-10-21. Accepted for the owner's request to import their agent and memory design from `trlongvn/yoagent`. The broad import layout is superseded by [ADR 0008](0008-compact-agent-directory.md).
 
 Vendor the MIT-licensed source at commit `fa42372e6cabf9ef2d2c4019693da8076e0ef3bb`, retaining its Agent loop, session/context machinery and optional Uteke memory integration. Exclude source repository memory databases, vector indexes, caches and credentials. Record provenance and narrowly scoped local patches so the imported design remains identifiable and maintainable.
 

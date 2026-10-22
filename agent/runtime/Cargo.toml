@@ -1,0 +1,32 @@
+[package]
+name = "agent"
+version = "0.25.11"
+edition = "2021"
+rust-version = "1.87"
+description = "The retained YoAgent loop, context, and memory runtime for the direct WebSocket CLI"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "time", "io-util"] }
+tokio-util = "0.7"
+serde = { version = "1.0.177", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+futures = "0.3"
+rand = "0.10"
+web-time = "1"
+uteke-core = { git = "https://github.com/codecoradev/uteke", tag = "v0.17.0", default-features = false, features = ["vecq"], optional = true }
+
+[features]
+default = ["native"]
+native = ["tokio/fs"]
+memory = ["dep:uteke-core"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["registry", "fmt"] }
+tempfile = "3"

@@ -1,0 +1,49 @@
+[package]
+name = "ws-llm-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Native yoagent client using the direct WebSocket LLM Gateway"
+license = "MIT"
+
+[lib]
+name = "ws_llm_agent"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+dotenvy = "0.15"
+futures-util = "0.3"
+libc = "0.2"
+reqwest = { version = "0.13", features = ["form", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["fs", "io-std", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+tokio-util = "0.7"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+yoagent = { package = "agent", path = "runtime", default-features = false, features = ["native"] }
+
+[features]
+default = []
+memory = ["yoagent/memory", "dep:toml"]
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[workspace]
+members = ["runtime"]
+default-members = ["."]
+resolver = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

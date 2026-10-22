@@ -1,35 +1,35 @@
 # YoAgent on the WebSocket Gateway
 
-`apps/agent` preserves the upstream YoAgent Agent loop and its optional Uteke memory integration. Its native `GatewayProvider` sends OpenAI-compatible Chat Completions directly over the existing WSS Gateway; it does not run the TypeScript adapter or another HTTP service.
+`agent/` contains the native Rust runner, the trimmed YoAgent runtime under `agent/runtime/`, and its optional Uteke memory integration. Its `GatewayProvider` sends OpenAI-compatible Chat Completions directly over the existing WSS Gateway; it does not run the TypeScript adapter or another HTTP service.
 
 ## Configure and run
 
 Install a stable Rust toolchain. The manifests declare Rust 1.87 or newer; this integration was validated with Rust 1.99.1. Cargo dependencies are pinned in `Cargo.lock`.
 
-Copy [`apps/agent/.env.example`](../apps/agent/.env.example) to `.env`, replace the placeholders with the confidential client settings and a currently authorized model alias, then set the file and exported credential envelope to owner-only permissions. Use the exact provider ID and model alias granted to the client in Identity. The model alias is the project authorization key; it is not an upstream model name.
+Copy [`agent/.env.example`](../agent/.env.example) to `.env`, replace the placeholders with the confidential client settings and a currently authorized model alias, then set the file and exported credential envelope to owner-only permissions. Use the exact provider ID and model alias granted to the client in Identity. The model alias is the project authorization key; it is not an upstream model name.
 
 From the repository root, provide task text over stdin or through a bounded UTF-8 file. The task body is never an argument:
 
 ```sh
-cargo run --package ws-llm-agent -- --config-env .env --task-file private/task.txt
-cat private/task.txt | cargo run --package ws-llm-agent -- --config-env .env
+cargo run --manifest-path agent/Cargo.toml --package ws-llm-agent -- --config-env .env --task-file private/task.txt
+cat private/task.txt | cargo run --manifest-path agent/Cargo.toml --package ws-llm-agent -- --config-env .env
 ```
 
 The runner reads no provider API key. It requests a short-lived Identity machine token and sends that token only in the WSS Authorization header; the encrypted envelope travels in the authenticated request frame. Neither value is printed. The base URL inside YoAgent's model metadata is inert: the custom provider handles the stream through Gateway.
 
 Runs have a 32 KiB task input ceiling, 16 MiB output ceiling, a five-minute generation deadline plus bounded shutdown grace, a bounded turn/token budget, and YoAgent retries are disabled. A nonzero exit means the request or its cleanup failed; stdout may contain partial or complete model text, so do not present it as complete until the failure is understood. Do not automatically retry an interrupted request. A new run is a separate provider attempt and may incur another charge.
 
-The default tool list is empty. Memory save/manage tools appear only when memory is explicitly configured; shell and filesystem tools are not registered by this runner. YoAgent's core library remains vendored for future deliberate tool design.
+The default tool list is empty. Memory save/manage tools appear only when memory is explicitly configured; shell and filesystem tools are not registered by this runner. The internal runtime contains only the core and memory paths required by this CLI, rather than the upstream TUI, unrelated integrations, or additional tool systems.
 
 ## Optional local memory
 
-Pass `--memory-config FILE` and compile with `--features memory` to enable the original Uteke integration. The checked-in [`apps/agent/memory.example.json`](../apps/agent/memory.example.json) is only a template; copy it to an owner-only file because the runner rejects group/world-readable or symlinked config files. It uses local Ollama embeddings and a per-project path below `.agent-state/`.
+Pass `--memory-config FILE` and compile with `--features memory` to enable the original Uteke integration. The checked-in [`agent/memory.example.json`](../agent/memory.example.json) is only a template; copy it to an owner-only file because the runner rejects group/world-readable or symlinked config files. It uses local Ollama embeddings and a per-project path below `.agent-state/`.
 
 ```sh
 mkdir -p private
 chmod 700 private
-install -m 600 apps/agent/memory.example.json private/memory.json
-cargo run --package ws-llm-agent --features memory -- \
+install -m 600 agent/memory.example.json private/memory.json
+cargo run --manifest-path agent/Cargo.toml --package ws-llm-agent --features memory -- \
   --config-env .env \
   --memory-config private/memory.json \
   --task-file private/task.txt
@@ -42,8 +42,8 @@ Persistent memory stays on the client. Recalled facts enter the model context se
 ## Validate changes
 
 ```sh
-cargo test --package ws-llm-agent --features memory
-cargo clippy --package ws-llm-agent --all-targets --all-features -- -D warnings
+cargo test --manifest-path agent/Cargo.toml --package ws-llm-agent --features memory
+cargo clippy --manifest-path agent/Cargo.toml --package ws-llm-agent --all-targets --all-features -- -D warnings
 npm run test:agent:native
 ```
 
@@ -57,4 +57,4 @@ The npm smoke requires `npm ci` and Cargo on PATH. It builds the binary and runs
 - The model receives no tools by default. Memory tools are scoped operationally by a private store dedicated to one project/agent; they do not grant server-side model permissions.
 - No real provider generation or external embedding call is implied by local compilation or fixture tests. Check [implementation status](IMPLEMENTATION-STATUS.md) for live evidence and remaining gates.
 
-For the request protocol and credential boundary, see [ADR 0007](decisions/0007-yoagent-direct-ws.md), [WebSocket protocol](PROTOCOL.md), and [the threat model](THREAT-MODEL.md).
+For the compact runtime scope, see [ADR 0008](decisions/0008-compact-agent-directory.md). For the direct WSS design and credential boundary, see [ADR 0007](decisions/0007-yoagent-direct-ws.md), [WebSocket protocol](PROTOCOL.md), and [the threat model](THREAT-MODEL.md).
